@@ -1,0 +1,19 @@
+---
+- name: Overlord IPA health check
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Check SSH connectivity
+      ansible.builtin.ping:
+
+    - name: Poll uptime
+      ansible.builtin.command: uptime
+      changed_when: false
+
+    - name: Poll logged in users
+      ansible.builtin.command: who
+      changed_when: false
+
+    - name: Poll disk usage
+      ansible.builtin.command: df -h
+      changed_when: false

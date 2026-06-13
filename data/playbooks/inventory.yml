@@ -1,0 +1,15 @@
+---
+- name: Overlord IPA inventory collection
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Collect hardware summary
+      ansible.builtin.setup:
+        gather_subset:
+          - hardware
+          - network
+          - virtual
+
+    - name: Collect operating system release
+      ansible.builtin.command: cat /etc/os-release
+      changed_when: false
