@@ -1,4 +1,5 @@
 export type ScheduleType = 0 | 1 | 2 | 3;
+export type JobLongevityType = 0 | 1 | 2 | 3;
 export type JobActionType = 0 | 1 | 2;
 export type JobRunStatus = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type JobRunTriggerType = 0 | 1 | 2 | 3;
@@ -7,8 +8,10 @@ export type JobHostResultStatus = 0 | 1 | 2 | 3 | 4 | 5;
 export interface DashboardSummary {
     hosts: number;
     jobs: number;
+    queued_jobs: number;
     running_jobs: number;
     failed_jobs: number;
+    recent_runs: JobRun[];
 }
 
 export type AuthRole = "viewer" | "editor";
@@ -38,6 +41,9 @@ export interface Job {
     interval_seconds: number;
     schedule_type: ScheduleType;
     cron_expr: string;
+    longevity_type: JobLongevityType;
+    max_runs: number;
+    disable_after: string;
     target_hostgroups: string[];
     created_at: string;
     updated_at: string;
@@ -60,6 +66,9 @@ export interface JobInput {
     interval_seconds: number;
     schedule_type: ScheduleType;
     cron_expr: string;
+    longevity_type: JobLongevityType;
+    max_runs: number;
+    disable_after: string;
     target_hostgroups: string[];
     actions: JobActionInput[];
 }
@@ -163,6 +172,9 @@ export interface ScheduledJob {
     schedule_type: ScheduleType;
     interval_seconds: number;
     cron_expr: string;
+    longevity_type: JobLongevityType;
+    max_runs: number;
+    disable_after: string;
     enabled: boolean;
 }
 
@@ -193,5 +205,8 @@ export interface DataFileInput {
 export interface JobsResponse {
     jobs: Job[];
     actions: Record<string, JobAction[]>;
+    runs: JobRun[];
+    action_runs: JobActionRun[];
+    host_results: JobHostResult[];
     scheduler: SchedulerSnapshot;
 }

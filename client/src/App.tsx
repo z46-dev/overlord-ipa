@@ -19,6 +19,7 @@ export function App() {
     const [page, setPage] = useState<Page>("dashboard");
     const [user, setUser] = useState<AuthenticatedUser | null>(null);
     const [loadingUser, setLoadingUser] = useState(true);
+    const [jobToOpen, setJobToOpen] = useState<number | null>(null);
 
     useEffect(() => {
         let mounted = true;
@@ -49,7 +50,13 @@ export function App() {
         logout().finally(() => {
             setUser(null);
             setPage("dashboard");
+            setJobToOpen(null);
         });
+    };
+
+    const openJob = (jobID: number) => {
+        setJobToOpen(jobID);
+        setPage("jobs");
     };
 
     if (loadingUser) {
@@ -83,47 +90,49 @@ export function App() {
                 </div>
             </header>
 
-            <div className="flex min-h-[calc(100vh-3rem)]">
-                <aside className="w-56 shrink-0 border-r border-[#d1d5db] bg-white">
-                    <nav className="p-2">
-                        {visibleNavItems.map((item) => (
-                            <button
-                                key={item.id}
-                                className={`block w-full rounded-sm px-3 py-2 text-left text-sm font-medium ${
-                                    page === item.id ? "bg-[#1f6fb2] text-white" : "text-[#1f2933] hover:bg-[#eef0f2]"
-                                }`}
-                                type="button"
-                                onClick={() => setPage(item.id)}
-                            >
-                                {item.label}
-                            </button>
-                        ))}
-                    </nav>
-                </aside>
+            <nav className="border-b border-[#b9c0c8] bg-white px-5">
+                <div className="flex h-10 items-end gap-1">
+                    {visibleNavItems.map((item) => (
+                        <button
+                            key={item.id}
+                            className={`border border-b-0 px-4 py-2 text-sm font-medium ${
+                                page === item.id
+                                    ? "border-[#b9c0c8] bg-[#f5f5f5] text-[#1f2933]"
+                                    : "border-transparent text-[#1f2933] hover:border-[#d1d5db] hover:bg-[#eef0f2]"
+                            }`}
+                            type="button"
+                            onClick={() => setPage(item.id)}
+                        >
+                            {item.label}
+                        </button>
+                    ))}
+                </div>
+            </nav>
 
-                <main className="min-w-0 flex-1">
-                    <div className="border-b border-[#d1d5db] bg-white px-5 py-3">
-                        <h1 className="text-lg font-semibold">{visibleNavItems.find((item) => item.id === page)?.label}</h1>
-                    </div>
-                    <div className="p-5">
-                        {page === "dashboard" ? <Dashboard /> : null}
-                        {page === "hosts" ? <Hosts canEdit={user.can_edit} /> : null}
-                        {page === "jobs" ? <Jobs canEdit={user.can_edit} /> : null}
-                        {page === "data" ? <Data canEdit={user.can_edit} /> : null}
-                    </div>
-                </main>
-            </div>
+            <main className="min-w-0">
+                <div className="border-b border-[#d1d5db] bg-[#f5f5f5] px-5 py-3">
+                    <h1 className="text-lg font-semibold">{visibleNavItems.find((item) => item.id === page)?.label}</h1>
+                </div>
+                <div className="p-5">
+                    {page === "dashboard" ? <Dashboard onOpenJob={openJob} /> : null}
+                    {page === "hosts" ? <Hosts canEdit={user.can_edit} /> : null}
+                    {page === "jobs" ? <Jobs canEdit={user.can_edit} openJobID={jobToOpen} onOpenJobHandled={() => setJobToOpen(null)} /> : null}
+                    {page === "data" ? <Data canEdit={user.can_edit} /> : null}
+                </div>
+            </main>
         </div>
     );
 }
 
 function LoginScreen({ onLogin }: { onLogin: (user: AuthenticatedUser) => void }) {
-    const [username, setUsername] = useState("");
-    const [password, setPassword] = useState("");
     const [error, setError] = useState("");
     const [submitting, setSubmitting] = useState(false);
 
     const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+        const formData = new FormData(event.currentTarget);
+        const username = String(formData.get("username") ?? "");
+        const password = String(formData.get("password") ?? "");
+
         event.preventDefault();
         setError("");
         setSubmitting(true);
@@ -151,7 +160,7 @@ function LoginScreen({ onLogin }: { onLogin: (user: AuthenticatedUser) => void }
                 <div className="border-b border-[#d1d5db] px-4 py-3">
                     <h1 className="text-base font-semibold">Log in with FreeIPA</h1>
                 </div>
-                <form className="space-y-4 p-4" autoComplete="on" onSubmit={handleSubmit}>
+                <form className="space-y-4 p-4" action="/api/auth/login" autoComplete="on" method="post" onSubmit={handleSubmit}>
                     {error ? <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div> : null}
                     <label className="block text-sm font-medium" htmlFor="username">
                         Username
@@ -160,10 +169,9 @@ function LoginScreen({ onLogin }: { onLogin: (user: AuthenticatedUser) => void }
                             name="username"
                             className="mt-1 w-full rounded-sm border border-[#d1d5db] px-3 py-2 text-sm outline-none focus:border-[#1f6fb2]"
                             autoComplete="username"
+                            autoCapitalize="none"
+                            spellCheck={false}
                             type="text"
-                            value={username}
-                            onChange={(event) => setUsername(event.target.value)}
-                            onInput={(event) => setUsername(event.currentTarget.value)}
                         />
                     </label>
                     <label className="block text-sm font-medium" htmlFor="password">
@@ -174,9 +182,6 @@ function LoginScreen({ onLogin }: { onLogin: (user: AuthenticatedUser) => void }
                             className="mt-1 w-full rounded-sm border border-[#d1d5db] px-3 py-2 text-sm outline-none focus:border-[#1f6fb2]"
                             autoComplete="current-password"
                             type="password"
-                            value={password}
-                            onChange={(event) => setPassword(event.target.value)}
-                            onInput={(event) => setPassword(event.currentTarget.value)}
                         />
                     </label>
                     <button

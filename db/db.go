@@ -75,7 +75,7 @@ func registerAndMigrate[T any]() (registered *gosqlite.RegisteredStruct[T], err 
 		return
 	}
 
-	log.Infof("%s", msg.String())
+	log.Infof("%s\n", msg.String())
 	return
 }
 

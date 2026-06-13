@@ -1,6 +1,22 @@
 # overlord-ipa
 A FreeIPA "Overlord" which can monitor, update, and collect information about enrolled Linux (currently) systems with a pretty dashboard with integrated FreeIPA logon!
 
+## Ansible SSH Requirements
+
+FreeIPA LDAP credentials are used for login, authorization, and inventory lookup. They are not used to SSH into managed hosts.
+
+Jobs run as the operating-system user that starts the backend process. That user must be able to SSH to target hosts non-interactively using SSH keys, GSSAPI/Kerberos, or another Ansible-supported SSH setup. Interactive password prompts and first-use host key prompts will fail inside the backend worker.
+
+Recommended runner setup:
+
+```toml
+[ansible]
+    ssh_common_args = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    remote_tmp = "/tmp/.ansible-${USER}-overlord-ipa"
+```
+
+If Overlord IPA later runs as a system service, configure SSH/Kerberos for that service account, not for the web user who clicks Run.
+
 ## Go Coding Rules
 
 Mandatory coding guidelines for Go:

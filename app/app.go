@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/z46-dev/golog"
 	"github.com/z46-dev/overlord-ipa/app/handlers"
 	"github.com/z46-dev/overlord-ipa/app/services"
 	"github.com/z46-dev/overlord-ipa/conf"
@@ -16,15 +17,19 @@ type Application struct {
 	scheduler *services.Scheduler
 	data      *services.DataFileService
 	jobs      *services.JobService
+	queue     *services.JobQueue
 }
 
 // New wires application dependencies.
-func New() (application *Application, err error) {
+func New(logger *golog.Logger) (application *Application, err error) {
 	var (
 		repository       *db.Repository           = db.NewRepository()
-		freeIPA          *services.FreeIPAService = services.NewFreeIPAService(conf.Conf)
+		freeIPA          *services.FreeIPAService = services.NewFreeIPAService(conf.Conf, repository, logger)
 		authService      *services.AuthService
 		dataFileService  *services.DataFileService
+		jobQueue         *services.JobQueue
+		ansibleRunner    *services.GoAnsibleRunner
+		inventoryWriter  *services.AnsibleInventoryWriter
 		jobService       *services.JobService
 		scheduler        *services.Scheduler
 		dashboardService *services.DashboardService
@@ -37,7 +42,20 @@ func New() (application *Application, err error) {
 	}
 
 	dataFileService = services.NewDataFileService(conf.Conf.Data)
-	jobService = services.NewJobService(repository, services.NewDefaultActionFactory(), freeIPA, dataFileService)
+	if jobQueue, err = services.NewJobQueue(conf.Conf.Gasket, logger); err != nil {
+		return
+	}
+
+	ansibleRunner = services.NewGoAnsibleRunner(conf.Conf.Ansible, dataFileService, logger)
+	inventoryWriter = services.NewAnsibleInventoryWriter(conf.Conf.Ansible, logger)
+	jobService = services.NewJobService(repository, services.NewDefaultActionFactory(), freeIPA, dataFileService, jobQueue, ansibleRunner, inventoryWriter, logger)
+	if err = jobQueue.RegisterJobRunConsumer(func(payload services.JobRunTaskPayload) (data []byte, err error) {
+		data, err = jobService.ExecuteQueuedJob(context.Background(), payload)
+		return
+	}); err != nil {
+		return
+	}
+
 	scheduler = services.NewScheduler(repository, services.NewMockExecutor())
 	dashboardService = services.NewDashboardService(repository)
 
@@ -58,6 +76,7 @@ func New() (application *Application, err error) {
 		scheduler: scheduler,
 		data:      dataFileService,
 		jobs:      jobService,
+		queue:     jobQueue,
 	}
 	return
 }
@@ -79,6 +98,13 @@ func (a *Application) Run(ctx context.Context) (err error) {
 		return
 	}
 
+	go func() {
+		var queueErr error
+		if queueErr = a.queue.Run(ctx); queueErr != nil && ctx.Err() == nil {
+			fmt.Printf("job queue stopped: %v\n", queueErr)
+		}
+	}()
+
 	if err = a.server.Listen(); err != nil {
 		return
 	}
@@ -87,9 +113,9 @@ func (a *Application) Run(ctx context.Context) (err error) {
 }
 
 // Init creates and runs the application.
-func Init() (err error) {
+func Init(logger *golog.Logger) (err error) {
 	var application *Application
-	if application, err = New(); err != nil {
+	if application, err = New(logger); err != nil {
 		return
 	}
 

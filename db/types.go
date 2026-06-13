@@ -4,23 +4,27 @@ import "time"
 
 type (
 	ScheduleType        uint8
+	JobLongevityType    uint8
 	JobActionType       uint8
 	JobRunStatus        uint8
 	JobRunTriggerType   uint8
 	JobHostResultStatus uint8
 
 	Job struct {
-		ID               int          `gosqlite:"id,primary,increment,unique" json:"id"`
-		Name             string       `gosqlite:"name,unique" json:"name"`
-		Description      string       `gosqlite:"description" json:"description"`
-		Enabled          bool         `gosqlite:"enabled" json:"enabled"`
-		Protected        bool         `gosqlite:"protected" json:"protected"`
-		IntervalSeconds  int64        `gosqlite:"interval_seconds" json:"interval_seconds"`
-		ScheduleType     ScheduleType `gosqlite:"schedule_type" json:"schedule_type"`
-		CronExpr         string       `gosqlite:"cron_expr" json:"cron_expr"`
-		TargetHostgroups []string     `gosqlite:"target_hostgroups" json:"target_hostgroups"`
-		CreatedAt        time.Time    `gosqlite:"created_at" json:"created_at"`
-		UpdatedAt        time.Time    `gosqlite:"updated_at" json:"updated_at"`
+		ID               int              `gosqlite:"id,primary,increment,unique" json:"id"`
+		Name             string           `gosqlite:"name,unique" json:"name"`
+		Description      string           `gosqlite:"description" json:"description"`
+		Enabled          bool             `gosqlite:"enabled" json:"enabled"`
+		Protected        bool             `gosqlite:"protected" json:"protected"`
+		IntervalSeconds  int64            `gosqlite:"interval_seconds" json:"interval_seconds"`
+		ScheduleType     ScheduleType     `gosqlite:"schedule_type" json:"schedule_type"`
+		CronExpr         string           `gosqlite:"cron_expr" json:"cron_expr"`
+		LongevityType    JobLongevityType `gosqlite:"longevity_type" json:"longevity_type"`
+		MaxRuns          int              `gosqlite:"max_runs" json:"max_runs"`
+		DisableAfter     time.Time        `gosqlite:"disable_after" json:"disable_after"`
+		TargetHostgroups []string         `gosqlite:"target_hostgroups" json:"target_hostgroups"`
+		CreatedAt        time.Time        `gosqlite:"created_at" json:"created_at"`
+		UpdatedAt        time.Time        `gosqlite:"updated_at" json:"updated_at"`
 	}
 
 	JobAction struct {
@@ -122,6 +126,13 @@ const (
 	ScheduleTypeInterval
 	ScheduleTypeManual
 	ScheduleTypeCron
+)
+
+const (
+	JobLongevityTypeUnknown JobLongevityType = iota
+	JobLongevityTypePermanent
+	JobLongevityTypeMaxRuns
+	JobLongevityTypeUntil
 )
 
 const (

@@ -72,9 +72,15 @@ func NewForbiddenError(message string, err error) (serviceErr *ServiceError) {
 
 // NewExecutionError creates an execution service error.
 func NewExecutionError(operation string, err error) (serviceErr *ServiceError) {
+	var message string = "job execution failed"
+
+	if err != nil {
+		message = fmt.Sprintf("job execution failed: %v", err)
+	}
+
 	serviceErr = &ServiceError{
 		Code:      ErrorCodeExecution,
-		Message:   "job execution failed",
+		Message:   message,
 		Operation: operation,
 		Err:       err,
 	}

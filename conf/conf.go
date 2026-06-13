@@ -8,6 +8,8 @@ type Config struct {
 	Server   ServerConfig   `toml:"server"`
 	Auth     AuthConfig     `toml:"auth"`
 	Data     DataConfig     `toml:"data"`
+	Ansible  AnsibleConfig  `toml:"ansible"`
+	Gasket   GasketConfig   `toml:"gasket"`
 }
 
 type DatabaseConfig struct {
@@ -50,6 +52,27 @@ type AuthConfig struct {
 
 type DataConfig struct {
 	Directory string `toml:"directory" default:"data" validate:"required"`
+}
+
+type AnsibleConfig struct {
+	WorkDir        string `toml:"work_dir" default:"run/ansible" validate:"required"`
+	PlaybookBinary string `toml:"playbook_binary" default:"ansible-playbook" validate:"required"`
+	AdhocBinary    string `toml:"adhoc_binary" default:"ansible" validate:"required"`
+	SSHUser        string `toml:"ssh_user" default:"" validate:"omitempty"`
+	SSHCommonArgs  string `toml:"ssh_common_args" default:"-o BatchMode=yes -o StrictHostKeyChecking=accept-new" validate:"omitempty"`
+	RemoteTmp      string `toml:"remote_tmp" default:"/tmp/.ansible-${USER}-overlord-ipa" validate:"required"`
+	TimeoutSeconds int    `toml:"timeout_seconds" default:"30" validate:"required,min=1"`
+	Forks          string `toml:"forks" default:"20" validate:"required"`
+}
+
+type GasketConfig struct {
+	DatabaseFile        string `toml:"database_file" default:"overlord-ipa-tasks.db" validate:"required,filepath"`
+	PollInterval        string `toml:"poll_interval" default:"250ms" validate:"required"`
+	LockRetryCount      int    `toml:"lock_retry_count" default:"20" validate:"required,min=1"`
+	LockRetryDelay      string `toml:"lock_retry_delay" default:"5ms" validate:"required"`
+	TaskRecoveryTimeout string `toml:"task_recovery_timeout" default:"5m" validate:"required"`
+	RetryCount          int    `toml:"retry_count" default:"1" validate:"min=0"`
+	RetryDelay          string `toml:"retry_delay" default:"30s" validate:"required"`
 }
 
 var Conf Config

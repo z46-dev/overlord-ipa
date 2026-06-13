@@ -12,6 +12,9 @@ import (
 type JobService interface {
 	ListJobs(ctx context.Context) ([]db.Job, error)
 	ListJobActions(ctx context.Context, jobID int) ([]db.JobAction, error)
+	ListRecentJobRuns(ctx context.Context, limit int) ([]db.JobRun, error)
+	ListJobActionRunsByRunIDs(ctx context.Context, runIDs []int) ([]db.JobActionRun, error)
+	ListJobHostResultsByRunIDs(ctx context.Context, runIDs []int) ([]db.JobHostResult, error)
 	CreateJob(ctx context.Context, input services.JobInput) (*db.Job, error)
 	UpdateJob(ctx context.Context, jobID int, input services.JobInput) (*db.Job, error)
 	RunJob(ctx context.Context, jobID int, triggeredBy string) (*db.JobRun, error)
@@ -38,8 +41,12 @@ func NewJobsHandler(jobs JobService, scheduler SchedulerService) (handler *JobsH
 // List writes configured jobs and scheduler state.
 func (h *JobsHandler) List(c fiber.Ctx) (err error) {
 	var (
-		jobs    []db.Job
-		actions map[int][]db.JobAction
+		jobs        []db.Job
+		actions     map[int][]db.JobAction
+		runs        []db.JobRun
+		actionRuns  []db.JobActionRun
+		hostResults []db.JobHostResult
+		runIDs      []int
 	)
 
 	if jobs, err = h.jobs.ListJobs(c.Context()); err != nil {
@@ -55,10 +62,33 @@ func (h *JobsHandler) List(c fiber.Ctx) (err error) {
 		}
 	}
 
+	if runs, err = h.jobs.ListRecentJobRuns(c.Context(), 20); err != nil {
+		err = writeError(c, err)
+		return
+	}
+
+	runIDs = make([]int, 0, len(runs))
+	for _, run := range runs {
+		runIDs = append(runIDs, run.ID)
+	}
+
+	if actionRuns, err = h.jobs.ListJobActionRunsByRunIDs(c.Context(), runIDs); err != nil {
+		err = writeError(c, err)
+		return
+	}
+
+	if hostResults, err = h.jobs.ListJobHostResultsByRunIDs(c.Context(), runIDs); err != nil {
+		err = writeError(c, err)
+		return
+	}
+
 	if err = c.JSON(fiber.Map{
-		"jobs":      jobs,
-		"actions":   actions,
-		"scheduler": h.scheduler.Snapshot(),
+		"jobs":         jobs,
+		"actions":      actions,
+		"runs":         runs,
+		"action_runs":  actionRuns,
+		"host_results": hostResults,
+		"scheduler":    h.scheduler.Snapshot(),
 	}); err != nil {
 		return
 	}

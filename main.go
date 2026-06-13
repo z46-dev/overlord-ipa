@@ -22,7 +22,7 @@ func main() {
 		panic(err)
 	}
 
-	if err = app.Init(); err != nil {
+	if err = app.Init(log); err != nil {
 		panic(err)
 	}
 }

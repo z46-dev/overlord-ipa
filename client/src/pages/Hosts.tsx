@@ -38,8 +38,12 @@ export function Hosts({ canEdit }: HostsProps) {
         { key: "fqdn", header: "FQDN", render: (host) => host.fqdn || "Unknown" },
         { key: "os", header: "OS", render: (host) => [host.os_name, host.os_version].filter(Boolean).join(" ") || "Unknown" },
         { key: "groups", header: "Host groups", render: (host) => host.hostgroups?.join(", ") || "None" },
+        { key: "cpu", header: "CPU", render: (host) => formatCPU(host) },
         { key: "memory", header: "Memory", render: (host) => (host.memory_mb > 0 ? `${host.memory_mb} MB` : "Unknown") },
-        { key: "health", header: "Health", render: () => <StatusBadge label="Unknown" tone="neutral" /> },
+        { key: "network", header: "Network", render: (host) => formatNetwork(host) },
+        { key: "disks", header: "Disks", render: (host) => formatDisks(host) },
+        { key: "health", header: "Health", render: (host) => <HealthBadge host={host} /> },
+        { key: "last_inventory", header: "Last inventory", render: (host) => formatDateTime(host.last_inventory_at) },
         { key: "last_seen", header: "Last seen", render: (host) => formatDateTime(host.last_seen_at) }
     ];
 
@@ -60,4 +64,58 @@ export function Hosts({ canEdit }: HostsProps) {
             <DataTable columns={columns} rows={hosts} getRowKey={(host) => host.id || host.hostname} emptyLabel="No hosts found" />
         </div>
     );
+}
+
+function HealthBadge({ host }: { host: Host }) {
+    if (!host.last_health_at || host.last_health_at.startsWith("0001-01-01")) {
+        return <StatusBadge label="Unknown" tone="neutral" />;
+    }
+
+    return <StatusBadge label="Checked" tone="success" />;
+}
+
+function formatCPU(host: Host): string {
+    const model = host.processor_model || "Unknown CPU";
+    const cores = host.processor_cores > 0 ? `${host.processor_cores}c` : "";
+    const threads = host.processor_threads > 0 ? `${host.processor_threads}t` : "";
+    const count = [cores, threads].filter(Boolean).join("/");
+
+    return count ? `${model} (${count})` : model;
+}
+
+function formatNetwork(host: Host): string {
+    if (!host.network_addresses || host.network_addresses.length === 0) {
+        return "Unknown";
+    }
+
+    return host.network_addresses
+        .map((address) => [address.ip_address, address.mac_address].filter(Boolean).join(" / "))
+        .join(", ");
+}
+
+function formatDisks(host: Host): string {
+    if (!host.disks || host.disks.length === 0) {
+        return "Unknown";
+    }
+
+    return host.disks
+        .slice(0, 2)
+        .map((disk) => `${disk.name}: ${formatBytes(disk.used)} / ${formatBytes(disk.size)}`)
+        .join(", ");
+}
+
+function formatBytes(value: number): string {
+    if (value >= 1024 * 1024 * 1024) {
+        return `${Math.round(value / 1024 / 1024 / 1024)} GB`;
+    }
+
+    if (value >= 1024 * 1024) {
+        return `${Math.round(value / 1024 / 1024)} MB`;
+    }
+
+    if (value >= 1024) {
+        return `${Math.round(value / 1024)} KB`;
+    }
+
+    return `${value} B`;
 }

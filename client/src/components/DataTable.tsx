@@ -12,9 +12,11 @@ interface DataTableProps<T> {
     rows: T[];
     getRowKey: (row: T) => string | number;
     emptyLabel?: string;
+    onRowClick?: (row: T) => void;
+    rowClassName?: (row: T) => string;
 }
 
-export function DataTable<T>({ columns, rows, getRowKey, emptyLabel = "No records" }: DataTableProps<T>) {
+export function DataTable<T>({ columns, rows, getRowKey, emptyLabel = "No records", onRowClick, rowClassName }: DataTableProps<T>) {
     return (
         <div className="overflow-hidden rounded border border-[#d1d5db] bg-white">
             <table className="min-w-full border-collapse text-left text-sm">
@@ -30,7 +32,11 @@ export function DataTable<T>({ columns, rows, getRowKey, emptyLabel = "No record
                 <tbody className="divide-y divide-[#e5e7eb]">
                     {rows.length > 0 ? (
                         rows.map((row) => (
-                            <tr key={getRowKey(row)} className="hover:bg-[#f8fafc]">
+                            <tr
+                                key={getRowKey(row)}
+                                className={`hover:bg-[#f8fafc] ${onRowClick ? "cursor-pointer" : ""} ${rowClassName?.(row) ?? ""}`}
+                                onClick={() => onRowClick?.(row)}
+                            >
                                 {columns.map((column) => (
                                     <td key={column.key} className={`px-3 py-2 align-top text-[#1f2933] ${column.className ?? ""}`}>
                                         {column.render(row)}

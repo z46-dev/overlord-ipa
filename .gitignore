@@ -1,7 +1,9 @@
 build/
+run/
 .env
 config.toml
 node_modules/
 package-lock.json
 bun.lockb
 *.db
+data/

@@ -3,12 +3,15 @@ package services
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/z46-dev/overlord-ipa/db"
 )
 
 type SchedulerRepository interface {
 	ListEnabledJobs(ctx context.Context) ([]db.Job, error)
+	UpdateJob(ctx context.Context, job *db.Job) error
+	CountJobRunsByJobID(ctx context.Context, jobID int) (int64, error)
 }
 
 type Executor interface {
@@ -29,12 +32,15 @@ func (e *MockExecutor) RunJob(job db.Job) (err error) {
 }
 
 type ScheduledJob struct {
-	ID              int             `json:"id"`
-	Name            string          `json:"name"`
-	ScheduleType    db.ScheduleType `json:"schedule_type"`
-	IntervalSeconds int64           `json:"interval_seconds"`
-	CronExpr        string          `json:"cron_expr"`
-	Enabled         bool            `json:"enabled"`
+	ID              int                 `json:"id"`
+	Name            string              `json:"name"`
+	ScheduleType    db.ScheduleType     `json:"schedule_type"`
+	IntervalSeconds int64               `json:"interval_seconds"`
+	CronExpr        string              `json:"cron_expr"`
+	LongevityType   db.JobLongevityType `json:"longevity_type"`
+	MaxRuns         int                 `json:"max_runs"`
+	DisableAfter    time.Time           `json:"disable_after"`
+	Enabled         bool                `json:"enabled"`
 }
 
 type SchedulerSnapshot struct {
@@ -60,8 +66,9 @@ func NewScheduler(repository SchedulerRepository, executor Executor) (scheduler 
 // Load reads enabled jobs into the scheduler snapshot.
 func (s *Scheduler) Load(ctx context.Context) (err error) {
 	var (
-		jobs      []db.Job
-		scheduled []ScheduledJob
+		jobs       []db.Job
+		scheduled  []ScheduledJob
+		disableJob bool
 	)
 
 	if jobs, err = s.repository.ListEnabledJobs(ctx); err != nil {
@@ -71,6 +78,21 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 
 	scheduled = make([]ScheduledJob, 0, len(jobs))
 	for _, job := range jobs {
+		if disableJob, _, err = s.shouldDisable(ctx, job); err != nil {
+			return
+		}
+
+		if disableJob {
+			job.Enabled = false
+			job.UpdatedAt = time.Now().UTC()
+			if err = s.repository.UpdateJob(ctx, &job); err != nil {
+				err = NewPersistenceError("disable expired job", err)
+				return
+			}
+
+			continue
+		}
+
 		if !isSchedulable(job) {
 			continue
 		}
@@ -81,6 +103,9 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 			ScheduleType:    job.ScheduleType,
 			IntervalSeconds: job.IntervalSeconds,
 			CronExpr:        job.CronExpr,
+			LongevityType:   normalizeScheduledLongevity(job.LongevityType),
+			MaxRuns:         job.MaxRuns,
+			DisableAfter:    job.DisableAfter,
 			Enabled:         job.Enabled,
 		})
 	}
@@ -88,6 +113,30 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 	s.mu.Lock()
 	s.jobs = scheduled
 	s.mu.Unlock()
+	return
+}
+
+// shouldDisable reports whether a job reached its longevity limit.
+func (s *Scheduler) shouldDisable(ctx context.Context, job db.Job) (disable bool, runCount int64, err error) {
+	switch normalizeScheduledLongevity(job.LongevityType) {
+	case db.JobLongevityTypePermanent:
+	case db.JobLongevityTypeMaxRuns:
+		if job.MaxRuns <= 0 {
+			return
+		}
+
+		if runCount, err = s.repository.CountJobRunsByJobID(ctx, job.ID); err != nil {
+			err = NewPersistenceError("count job runs", err)
+			return
+		}
+
+		disable = runCount >= int64(job.MaxRuns)
+	case db.JobLongevityTypeUntil:
+		if !job.DisableAfter.IsZero() && !job.DisableAfter.After(time.Now().UTC()) {
+			disable = true
+		}
+	}
+
 	return
 }
 
@@ -99,6 +148,16 @@ func (s *Scheduler) Snapshot() (snapshot SchedulerSnapshot) {
 	var jobs []ScheduledJob = make([]ScheduledJob, len(s.jobs))
 	copy(jobs, s.jobs)
 	snapshot = SchedulerSnapshot{LoadedJobs: jobs}
+	return
+}
+
+// normalizeScheduledLongevity maps unset longevity to permanent.
+func normalizeScheduledLongevity(longevityType db.JobLongevityType) (normalized db.JobLongevityType) {
+	normalized = longevityType
+	if normalized == db.JobLongevityTypeUnknown {
+		normalized = db.JobLongevityTypePermanent
+	}
+
 	return
 }
 

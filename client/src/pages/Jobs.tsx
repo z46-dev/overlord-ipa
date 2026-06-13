@@ -1,12 +1,15 @@
-import { FormEvent, useEffect, useState } from "react";
-import { createJob, getDataFiles, getHostGroups, getJobs, updateJob } from "../api/client";
-import type { DataFileInfo, Job, JobAction, JobActionInput, JobActionType, JobInput, SchedulerSnapshot, ScheduleType } from "../api/types";
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { createJob, getDataFiles, getHostGroups, getJobs, runJob, updateJob } from "../api/client";
+import type { DataFileInfo, Job, JobAction, JobActionInput, JobActionType, JobInput, JobLongevityType, JobRun, SchedulerSnapshot, ScheduleType } from "../api/types";
 import { DataTable, type DataTableColumn } from "../components/DataTable";
 import { StatusBadge } from "../components/StatusBadge";
-import { cronExpressionValid, formatCronDescription, formatSchedule, jobEnabledTone, scheduleTone, scheduleTypeLabel } from "./format";
+import { cronExpressionValid, formatCronDescription, formatDateTime, formatSchedule, jobEnabledTone, jobRunStatusLabel, jobRunStatusTone, scheduleTone, scheduleTypeLabel } from "./format";
 
 interface JobsProps {
     canEdit: boolean;
+    openJobID?: number | null;
+    onOpenJobHandled?: () => void;
 }
 
 const actionTypes: Array<{ value: JobActionType; label: string }> = [
@@ -14,10 +17,16 @@ const actionTypes: Array<{ value: JobActionType; label: string }> = [
     { value: 2, label: "Shell" }
 ];
 
-const scheduleOptions: Array<{ value: ScheduleType; label: string; detail: string }> = [
-    { value: 1, label: "Interval", detail: "Repeats every fixed number of seconds" },
-    { value: 3, label: "Cron", detail: "Runs from a cron expression" },
-    { value: 2, label: "Manual", detail: "Runs only when started by an editor" }
+const scheduleOptions: Array<{ value: ScheduleType; label: string }> = [
+    { value: 1, label: "Interval" },
+    { value: 3, label: "Cron" },
+    { value: 2, label: "Manual" }
+];
+
+const longevityOptions: Array<{ value: JobLongevityType; label: string }> = [
+    { value: 1, label: "Permanent" },
+    { value: 2, label: "Run count" },
+    { value: 3, label: "Until date" }
 ];
 
 function newActionInput(): JobActionInput {
@@ -40,6 +49,9 @@ function newJobInput(): JobInput {
         interval_seconds: 300,
         schedule_type: 2,
         cron_expr: "",
+        longevity_type: 1,
+        max_runs: 0,
+        disable_after: zeroTime(),
         target_hostgroups: [],
         actions: [newActionInput()]
     };
@@ -61,18 +73,21 @@ function actionToInput(action: JobAction | undefined): JobActionInput {
     };
 }
 
-export function Jobs({ canEdit }: JobsProps) {
+export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
     const [jobs, setJobs] = useState<Job[]>([]);
     const [jobActions, setJobActions] = useState<Record<string, JobAction[]>>({});
+    const [jobRuns, setJobRuns] = useState<JobRun[]>([]);
     const [scheduler, setScheduler] = useState<SchedulerSnapshot>({ loaded_jobs: [] });
     const [hostGroups, setHostGroups] = useState<string[]>([]);
     const [dataFiles, setDataFiles] = useState<DataFileInfo[]>([]);
     const [error, setError] = useState<string>("");
+    const [notice, setNotice] = useState<string>("");
     const [formError, setFormError] = useState<string>("");
     const [input, setInput] = useState<JobInput>(newJobInput());
     const [editingJob, setEditingJob] = useState<Job | null>(null);
     const [editorOpen, setEditorOpen] = useState(false);
     const [saving, setSaving] = useState(false);
+    const [runningJobID, setRunningJobID] = useState<number | null>(null);
     const [hostGroupQuery, setHostGroupQuery] = useState("");
     const [hostGroupOpen, setHostGroupOpen] = useState(false);
 
@@ -81,6 +96,7 @@ export function Jobs({ canEdit }: JobsProps) {
             .then((response) => {
                 setJobs(response.jobs);
                 setJobActions(response.actions ?? {});
+                setJobRuns(response.runs ?? []);
                 setScheduler(response.scheduler);
             })
             .catch((err: unknown) => {
@@ -109,6 +125,29 @@ export function Jobs({ canEdit }: JobsProps) {
             });
     }, [canEdit]);
 
+    useEffect(() => {
+        if (!openJobID) {
+            return;
+        }
+
+        if (!canEdit) {
+            onOpenJobHandled?.();
+            return;
+        }
+
+        if (jobs.length === 0) {
+            return;
+        }
+
+        const job = jobs.find((item) => item.id === openJobID);
+        if (!job) {
+            return;
+        }
+
+        openEditJob(job);
+        onOpenJobHandled?.();
+    }, [openJobID, canEdit, jobs, jobActions]);
+
     const loadedJobIDs = new Set(scheduler.loaded_jobs.map((job) => job.id));
     const availableHostGroups = hostGroups.filter((group) => {
         if (input.target_hostgroups.includes(group)) {
@@ -118,6 +157,13 @@ export function Jobs({ canEdit }: JobsProps) {
         return group.toLowerCase().includes(hostGroupQuery.toLowerCase());
     });
     const selectedAction = input.actions[0] ?? newActionInput();
+    const latestRunByJobID = new Map<number, JobRun>();
+    for (const run of jobRuns) {
+        if (!latestRunByJobID.has(Number(run.job_id))) {
+            latestRunByJobID.set(Number(run.job_id), run);
+        }
+    }
+
     const availableActionFiles = dataFiles.filter((file) => {
         if (selectedAction.type === 1) {
             return file.kind === "playbook";
@@ -152,6 +198,9 @@ export function Jobs({ canEdit }: JobsProps) {
             interval_seconds: job.interval_seconds || 300,
             schedule_type: job.schedule_type,
             cron_expr: job.cron_expr,
+            longevity_type: job.longevity_type || 1,
+            max_runs: job.max_runs || 0,
+            disable_after: job.disable_after || zeroTime(),
             target_hostgroups: job.target_hostgroups ?? [],
             actions: [actionToInput(jobActions[String(job.id)]?.[0])]
         });
@@ -187,6 +236,24 @@ export function Jobs({ canEdit }: JobsProps) {
             });
     };
 
+    const runSelectedJob = (job: Job) => {
+        setError("");
+        setNotice("");
+        setRunningJobID(job.id);
+
+        runJob(job.id)
+            .then((run) => {
+                setNotice(`Queued ${job.name} as run #${run.id}`);
+                loadJobs();
+            })
+            .catch((err: unknown) => {
+                setError(err instanceof Error ? err.message : "Unable to run job");
+            })
+            .finally(() => {
+                setRunningJobID(null);
+            });
+    };
+
     const setAction = (patch: Partial<JobActionInput>) => {
         setInput({
             ...input,
@@ -208,6 +275,15 @@ export function Jobs({ canEdit }: JobsProps) {
             schedule_type: scheduleType,
             interval_seconds: scheduleType === 1 ? input.interval_seconds || 300 : input.interval_seconds,
             cron_expr: scheduleType === 3 ? input.cron_expr : ""
+        });
+    };
+
+    const setLongevityType = (longevityType: JobLongevityType) => {
+        setInput({
+            ...input,
+            longevity_type: longevityType,
+            max_runs: longevityType === 2 ? input.max_runs || 1 : 0,
+            disable_after: longevityType === 3 ? input.disable_after : zeroTime()
         });
     };
 
@@ -246,8 +322,10 @@ export function Jobs({ canEdit }: JobsProps) {
         { key: "name", header: "Name", render: (job) => <span className="font-medium">{job.name}</span> },
         { key: "description", header: "Description", render: (job) => job.description || "No description" },
         { key: "schedule", header: "Schedule", render: (job) => <ScheduleCell job={job} /> },
+        { key: "longevity", header: "Longevity", render: (job) => formatLongevity(job) },
         { key: "targets", header: "Targets", render: (job) => job.target_hostgroups?.join(", ") || "None" },
         { key: "action_file", header: "Action file", render: (job) => jobActions[String(job.id)]?.[0]?.file_path || "None" },
+        { key: "last_run", header: "Last run", render: (job) => <LastRunCell run={latestRunByJobID.get(job.id)} /> },
         { key: "protected", header: "Type", render: (job) => <StatusBadge label={job.protected ? "Protected" : "Custom"} tone="neutral" /> },
         {
             key: "enabled",
@@ -262,13 +340,23 @@ export function Jobs({ canEdit }: JobsProps) {
             )
         },
         {
-            key: "actions",
+            key: "run",
             header: "",
-            render: (job) => (
-                <button className="text-sm font-medium text-[#1f6fb2] disabled:text-[#9ca3af]" disabled={!canEdit} type="button" onClick={() => openEditJob(job)}>
-                    Edit
-                </button>
-            )
+            className: "w-24 text-right",
+            render: (job) =>
+                canEdit ? (
+                    <button
+                        className="rounded-sm border border-[#1f6fb2] px-2 py-1 text-xs font-medium text-[#1f6fb2] hover:bg-[#e8f1fa] disabled:cursor-not-allowed disabled:border-[#9ca3af] disabled:text-[#6b7280]"
+                        disabled={runningJobID === job.id}
+                        type="button"
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            runSelectedJob(job);
+                        }}
+                    >
+                        {runningJobID === job.id ? "Queuing" : "Run"}
+                    </button>
+                ) : null
         }
     ];
 
@@ -287,11 +375,12 @@ export function Jobs({ canEdit }: JobsProps) {
             </div>
 
             {error ? <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div> : null}
-            <DataTable columns={columns} rows={jobs} getRowKey={(job) => job.id} emptyLabel="No jobs configured" />
+            {notice ? <div className="rounded border border-[#9dbfe0] bg-[#e8f1fa] px-3 py-2 text-sm text-[#155a96]">{notice}</div> : null}
+            <DataTable columns={columns} rows={jobs} getRowKey={(job) => job.id} emptyLabel="No jobs configured" onRowClick={canEdit ? openEditJob : undefined} />
 
             {canEdit && editorOpen ? (
                 <div
-                    className="fixed inset-0 z-50 flex items-start justify-center bg-black/35 px-4 py-10"
+                    className="fixed inset-0 z-50 flex items-start justify-center bg-black/35 px-4 pb-8 pt-16"
                     role="presentation"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) {
@@ -332,51 +421,9 @@ export function Jobs({ canEdit }: JobsProps) {
                                     <input checked={input.enabled} type="checkbox" onChange={(event) => setInput({ ...input, enabled: event.target.checked })} />
                                     Enabled
                                 </label>
-                                <div className="md:col-span-6">
-                                    <div className="mb-1 text-sm font-medium">Schedule</div>
-                                    <div className="grid overflow-hidden rounded-sm border border-[#d1d5db] bg-white md:grid-cols-3">
-                                        {scheduleOptions.map((option) => (
-                                            <button
-                                                className={scheduleButtonClass(input.schedule_type === option.value)}
-                                                key={option.value}
-                                                type="button"
-                                                onClick={() => setScheduleType(option.value)}
-                                            >
-                                                <span className="block text-sm font-semibold">{option.label}</span>
-                                                <span className="mt-0.5 block text-xs font-normal opacity-80">{option.detail}</span>
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
+                                <ScheduleEditor input={input} onChange={setInput} onTypeChange={setScheduleType} />
 
-                                {input.schedule_type === 1 ? (
-                                    <label className="text-sm font-medium md:col-span-2">
-                                        Interval seconds
-                                        <input
-                                            className="mt-1 w-full rounded-sm border border-[#d1d5db] px-2 py-1.5"
-                                            min={1}
-                                            type="number"
-                                            value={input.interval_seconds}
-                                            onChange={(event) => setInput({ ...input, interval_seconds: Number(event.target.value) })}
-                                        />
-                                    </label>
-                                ) : null}
-
-                                {input.schedule_type === 3 ? (
-                                    <div className="md:col-span-3">
-                                        <label className="block text-sm font-medium">
-                                            Cron expression
-                                            <input
-                                                className="mt-1 w-full rounded-sm border border-[#d1d5db] px-2 py-1.5 font-mono text-xs"
-                                                value={input.cron_expr}
-                                                onChange={(event) => setInput({ ...input, cron_expr: event.target.value })}
-                                            />
-                                        </label>
-                                        <div className={`mt-1 text-xs ${cronExpressionValid(input.cron_expr) ? "text-[#6b7280]" : "text-red-700"}`}>
-                                            {formatCronDescription(input.cron_expr)}
-                                        </div>
-                                    </div>
-                                ) : null}
+                                <LongevityEditor input={input} onChange={setInput} onTypeChange={setLongevityType} />
 
                                 <HostGroupSelect
                                     availableGroups={availableHostGroups}
@@ -476,12 +523,158 @@ function ScheduleCell({ job }: { job: Job }) {
     );
 }
 
-function scheduleButtonClass(active: boolean): string {
-    if (active) {
-        return "min-h-[3.25rem] border-r border-[#155a96] bg-[#1f6fb2] px-3 py-2 text-left text-white last:border-r-0";
+function LastRunCell({ run }: { run?: JobRun }) {
+    if (!run) {
+        return <span className="text-sm text-[#6b7280]">Never</span>;
     }
 
-    return "min-h-[3.25rem] border-r border-[#d1d5db] bg-white px-3 py-2 text-left text-[#1f2933] hover:bg-[#eef0f2] last:border-r-0";
+    return (
+        <div className="space-y-1">
+            <div className="flex items-center gap-2">
+                <StatusBadge label={jobRunStatusLabel(run)} tone={jobRunStatusTone(run)} />
+                <span className="text-xs text-[#6b7280]">{formatDateTime(run.start_time)}</span>
+            </div>
+            {run.error ? <div className="max-w-80 truncate text-xs text-red-800">{run.error}</div> : null}
+        </div>
+    );
+}
+
+function ScheduleEditor({ input, onChange, onTypeChange }: { input: JobInput; onChange: (input: JobInput) => void; onTypeChange: (scheduleType: ScheduleType) => void }) {
+    return (
+        <div className="md:col-span-6">
+            <div className="mb-1 text-sm font-medium">Schedule</div>
+            <div className="overflow-hidden rounded-sm border border-[#d1d5db] bg-white">
+                <div className="grid md:grid-cols-3">
+                    {scheduleOptions.map((option) => (
+                        <button className={segmentButtonClass(input.schedule_type === option.value)} key={option.value} type="button" onClick={() => onTypeChange(option.value)}>
+                            {option.label}
+                        </button>
+                    ))}
+                </div>
+                <div className="border-t border-[#d1d5db] bg-[#f8fafc] px-3 py-2">
+                    {input.schedule_type === 1 ? (
+                        <label className="flex items-center gap-3 text-sm font-medium">
+                            Interval seconds
+                            <input
+                                className="w-32 rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 text-sm text-[#1f2933]"
+                                min={1}
+                                type="number"
+                                value={input.interval_seconds}
+                                onChange={(event) => onChange({ ...input, interval_seconds: Number(event.target.value) })}
+                            />
+                        </label>
+                    ) : null}
+
+                    {input.schedule_type === 3 ? (
+                        <div className="grid gap-2 md:grid-cols-[minmax(220px,340px)_1fr]">
+                            <input
+                                className="rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 font-mono text-xs text-[#1f2933]"
+                                value={input.cron_expr}
+                                onChange={(event) => onChange({ ...input, cron_expr: event.target.value })}
+                            />
+                            <div className={`self-center text-xs ${cronExpressionValid(input.cron_expr) ? "text-[#6b7280]" : "text-red-700"}`}>
+                                {formatCronDescription(input.cron_expr)}
+                            </div>
+                        </div>
+                    ) : null}
+
+                    {input.schedule_type === 2 ? <div className="h-8" /> : null}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function LongevityEditor({ input, onChange, onTypeChange }: { input: JobInput; onChange: (input: JobInput) => void; onTypeChange: (longevityType: JobLongevityType) => void }) {
+    return (
+        <div className="md:col-span-6">
+            <div className="mb-1 text-sm font-medium">Longevity</div>
+            <div className="overflow-hidden rounded-sm border border-[#d1d5db] bg-white">
+                <div className="grid md:grid-cols-3">
+                    {longevityOptions.map((option) => (
+                        <button className={segmentButtonClass(input.longevity_type === option.value)} key={option.value} type="button" onClick={() => onTypeChange(option.value)}>
+                            {option.label}
+                        </button>
+                    ))}
+                </div>
+                <div className="border-t border-[#d1d5db] bg-[#f8fafc] px-3 py-2">
+                    {input.longevity_type === 1 ? <div className="h-8" /> : null}
+
+                    {input.longevity_type === 2 ? (
+                        <label className="flex items-center gap-3 text-sm font-medium">
+                            Max runs
+                            <input
+                                className="w-32 rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 text-sm text-[#1f2933]"
+                                min={1}
+                                type="number"
+                                value={input.max_runs}
+                                onChange={(event) => onChange({ ...input, max_runs: Number(event.target.value) })}
+                            />
+                        </label>
+                    ) : null}
+
+                    {input.longevity_type === 3 ? (
+                        <label className="flex items-center gap-3 text-sm font-medium">
+                            Disable after
+                            <input
+                                className="rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 text-sm text-[#1f2933]"
+                                type="datetime-local"
+                                value={toDateTimeLocal(input.disable_after)}
+                                onChange={(event) => onChange({ ...input, disable_after: fromDateTimeLocal(event.target.value) })}
+                            />
+                        </label>
+                    ) : null}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function segmentButtonClass(active: boolean): string {
+    if (active) {
+        return "h-10 border-r border-[#d1d5db] border-b-2 border-b-[#1f6fb2] bg-[#e8f1fa] px-3 text-left text-sm font-semibold text-[#1f2933] last:border-r-0";
+    }
+
+    return "h-10 border-r border-[#d1d5db] border-b-2 border-b-transparent bg-white px-3 text-left text-sm font-medium text-[#1f2933] hover:bg-[#eef0f2] last:border-r-0";
+}
+
+function formatLongevity(job: Job): string {
+    switch (job.longevity_type || 1) {
+        case 1:
+            return "Permanent";
+        case 2:
+            return job.max_runs > 0 ? `${job.max_runs} runs` : "Run count";
+        case 3:
+            return job.disable_after && !job.disable_after.startsWith("0001-01-01") ? `Until ${new Date(job.disable_after).toLocaleString()}` : "Until date";
+        default:
+            return "Unknown";
+    }
+}
+
+function zeroTime(): string {
+    return "0001-01-01T00:00:00Z";
+}
+
+function toDateTimeLocal(value: string): string {
+    if (!value || value.startsWith("0001-01-01")) {
+        return "";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return "";
+    }
+
+    const offset = date.getTimezoneOffset() * 60000;
+    return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function fromDateTimeLocal(value: string): string {
+    if (!value) {
+        return zeroTime();
+    }
+
+    return new Date(value).toISOString();
 }
 
 interface HostGroupSelectProps {
@@ -507,8 +700,40 @@ function HostGroupSelect({
     onRemove,
     onRemoveLast
 }: HostGroupSelectProps) {
+    const rootRef = useRef<HTMLDivElement | null>(null);
+    const [menuBox, setMenuBox] = useState({ left: 0, top: 0, width: 0 });
+
+    useLayoutEffect(() => {
+        const updateMenuBox = () => {
+            const rect = rootRef.current?.getBoundingClientRect();
+            if (!rect) {
+                return;
+            }
+
+            setMenuBox({
+                left: rect.left,
+                top: rect.bottom + 4,
+                width: rect.width
+            });
+        };
+
+        if (!open) {
+            return;
+        }
+
+        updateMenuBox();
+        window.addEventListener("resize", updateMenuBox);
+        window.addEventListener("scroll", updateMenuBox, true);
+
+        return () => {
+            window.removeEventListener("resize", updateMenuBox);
+            window.removeEventListener("scroll", updateMenuBox, true);
+        };
+    }, [open, selectedGroups.length, query]);
+
     return (
         <div
+            ref={rootRef}
             className="relative md:col-span-6"
             onBlur={(event) => {
                 if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
@@ -551,25 +776,36 @@ function HostGroupSelect({
                 </div>
             </label>
 
-            {open ? (
-                <div className="absolute bottom-full z-30 mb-1 max-h-56 w-full overflow-y-auto rounded-sm border border-[#9ca3af] bg-white shadow-lg">
-                    {availableGroups.length > 0 ? (
-                        availableGroups.map((group) => (
-                            <button
-                                className="block w-full border-b border-[#e5e7eb] px-3 py-2 text-left text-sm last:border-b-0 hover:bg-[#eef0f2]"
-                                key={group}
-                                type="button"
-                                onMouseDown={(event) => event.preventDefault()}
-                                onClick={() => onAdd(group)}
-                            >
-                                {group}
-                            </button>
-                        ))
-                    ) : (
-                        <div className="px-3 py-2 text-sm text-[#6b7280]">No matches</div>
-                    )}
-                </div>
-            ) : null}
+            {open && menuBox.width > 0 ? createPortal(<HostGroupMenu availableGroups={availableGroups} box={menuBox} onAdd={onAdd} />, document.body) : null}
+        </div>
+    );
+}
+
+function HostGroupMenu({ availableGroups, box, onAdd }: { availableGroups: string[]; box: { left: number; top: number; width: number }; onAdd: (group: string) => void }) {
+    return (
+        <div
+            className="fixed z-[80] max-h-56 overflow-y-auto rounded-sm border border-[#9ca3af] bg-white shadow-lg"
+            style={{
+                left: box.left,
+                top: box.top,
+                width: box.width
+            }}
+        >
+            {availableGroups.length > 0 ? (
+                availableGroups.map((group) => (
+                    <button
+                        className="block w-full border-b border-[#e5e7eb] px-3 py-2 text-left text-sm last:border-b-0 hover:bg-[#eef0f2]"
+                        key={group}
+                        type="button"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => onAdd(group)}
+                    >
+                        {group}
+                    </button>
+                ))
+            ) : (
+                <div className="px-3 py-2 text-sm text-[#6b7280]">No matches</div>
+            )}
         </div>
     );
 }

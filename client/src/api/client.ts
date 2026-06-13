@@ -7,6 +7,7 @@ import type {
     Host,
     Job,
     JobInput,
+    JobRun,
     JobsResponse,
     LoginRequest
 } from "./types";
@@ -94,6 +95,12 @@ export function updateJob(id: number, requestBody: JobInput): Promise<Job> {
     return request<Job>(`/api/jobs/${id}`, {
         method: "PUT",
         body: JSON.stringify(requestBody)
+    });
+}
+
+export function runJob(id: number): Promise<JobRun> {
+    return request<JobRun>(`/api/jobs/${id}/run`, {
+        method: "POST"
     });
 }
 

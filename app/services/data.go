@@ -55,6 +55,7 @@ func NewDataFileService(config conf.DataConfig) (service *DataFileService) {
 		root: config.Directory,
 		protectedFiles: map[string]string{
 			"playbooks/health.yml":          defaultHealthPlaybook,
+			"playbooks/heartbeat.yml":       defaultHeartbeatPlaybook,
 			"playbooks/inventory.yml":       defaultInventoryPlaybook,
 			"playbooks/software-update.yml": defaultSoftwareUpdatePlaybook,
 		},
@@ -345,6 +346,19 @@ func (s *DataFileService) ValidateActionFile(ctx context.Context, path string, a
 	return
 }
 
+// ResolveActionPath validates an action file and returns its absolute data-directory path.
+func (s *DataFileService) ResolveActionPath(ctx context.Context, path string, actionType db.JobActionType) (absolutePath string, err error) {
+	if err = s.ValidateActionFile(ctx, path, actionType); err != nil {
+		return
+	}
+
+	if absolutePath, err = s.resolvePath(path); err != nil {
+		return
+	}
+
+	return
+}
+
 // normalizePath validates a relative data file path.
 func (s *DataFileService) normalizePath(path string) (normalized string, err error) {
 	normalized = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
@@ -413,22 +427,56 @@ func dataFileKind(path string) (kind DataFileKind) {
 const defaultHealthPlaybook string = `---
 - name: Overlord IPA health check
   hosts: all
-  gather_facts: false
+  gather_facts: true
   tasks:
-    - name: Check SSH connectivity
-      ansible.builtin.ping:
+    - name: Poll disk usage
+      ansible.builtin.command: df -P
+      changed_when: false
+      register: overlord_disk_usage
 
-    - name: Poll uptime
+    - name: Poll load average
+      ansible.builtin.command: cat /proc/loadavg
+      changed_when: false
+      register: overlord_load_average
+
+    - name: Report low root filesystem space
+      ansible.builtin.debug:
+        msg: "Major warning: root filesystem usage is above 90 percent"
+      when: overlord_disk_usage.stdout is search(' /$') and overlord_disk_usage.stdout is search('9[0-9]%')
+
+    - name: Report memory pressure
+      ansible.builtin.debug:
+        msg: "Major warning: available memory is below 10 percent"
+      when:
+        - ansible_facts.memtotal_mb | int > 0
+        - (ansible_facts.memfree_mb | int / ansible_facts.memtotal_mb | int) < 0.10
+`
+
+const defaultHeartbeatPlaybook string = `---
+- name: Overlord IPA heartbeat check
+  hosts: all
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Check SSH login
+      ansible.builtin.ping:
+      register: overlord_heartbeat
+      failed_when: false
+
+    - name: Report unreachable host
+      ansible.builtin.debug:
+        msg: "Host is unreachable"
+      when: overlord_heartbeat.unreachable | default(false)
+
+    - name: Enumerate uptime
       ansible.builtin.command: uptime
       changed_when: false
+      when: not (overlord_heartbeat.unreachable | default(false))
 
-    - name: Poll logged in users
+    - name: Enumerate online users
       ansible.builtin.command: who
       changed_when: false
-
-    - name: Poll disk usage
-      ansible.builtin.command: df -h
-      changed_when: false
+      when: not (overlord_heartbeat.unreachable | default(false))
 `
 
 const defaultInventoryPlaybook string = `---

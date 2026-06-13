@@ -6,22 +6,36 @@ import (
 	"strings"
 	"time"
 
+	"github.com/z46-dev/golog"
 	"github.com/z46-dev/overlord-ipa/db"
 )
 
 type JobRepository interface {
 	ListJobs(ctx context.Context) ([]db.Job, error)
 	GetJob(ctx context.Context, id int) (*db.Job, error)
+	GetJobRun(ctx context.Context, id int) (*db.JobRun, error)
 	GetJobByName(ctx context.Context, name string) (*db.Job, error)
 	InsertJob(ctx context.Context, job *db.Job) error
 	UpdateJob(ctx context.Context, job *db.Job) error
+	InsertJobRun(ctx context.Context, run *db.JobRun) error
+	UpdateJobRun(ctx context.Context, run *db.JobRun) error
 	InsertJobAction(ctx context.Context, action *db.JobAction) error
+	UpdateJobAction(ctx context.Context, action *db.JobAction) error
+	InsertJobActionRun(ctx context.Context, run *db.JobActionRun) error
+	UpdateJobActionRun(ctx context.Context, run *db.JobActionRun) error
+	ListRecentJobRuns(ctx context.Context, limit int) ([]db.JobRun, error)
+	ListJobActionRunsByRunIDs(ctx context.Context, runIDs []int) ([]db.JobActionRun, error)
+	ListJobHostResultsByRunIDs(ctx context.Context, runIDs []int) ([]db.JobHostResult, error)
+	UpsertHost(ctx context.Context, host *db.Host) error
+	InsertJobHostResult(ctx context.Context, result *db.JobHostResult) error
 	DeleteJobActions(ctx context.Context, jobID int) error
+	DeleteJobAction(ctx context.Context, actionID int) error
 	ListJobActions(ctx context.Context, jobID int) ([]db.JobAction, error)
 }
 
-type HostGroupProvider interface {
+type JobHostProvider interface {
 	GetHostGroups(ctx context.Context) ([]string, error)
+	GetHostsForGroups(ctx context.Context, groups []string) ([]db.Host, error)
 }
 
 type ActionFileValidator interface {
@@ -39,8 +53,12 @@ type ActionFactory interface {
 type JobService struct {
 	repository JobRepository
 	actions    ActionFactory
-	groups     HostGroupProvider
+	groups     JobHostProvider
 	files      ActionFileValidator
+	queue      *JobQueue
+	ansible    *GoAnsibleRunner
+	inventory  *AnsibleInventoryWriter
+	log        *golog.Logger
 }
 
 type JobActionInput struct {
@@ -54,31 +72,40 @@ type JobActionInput struct {
 }
 
 type JobInput struct {
-	Name             string           `json:"name"`
-	Description      string           `json:"description"`
-	Enabled          bool             `json:"enabled"`
-	IntervalSeconds  int64            `json:"interval_seconds"`
-	ScheduleType     db.ScheduleType  `json:"schedule_type"`
-	CronExpr         string           `json:"cron_expr"`
-	TargetHostgroups []string         `json:"target_hostgroups"`
-	Actions          []JobActionInput `json:"actions"`
+	Name             string              `json:"name"`
+	Description      string              `json:"description"`
+	Enabled          bool                `json:"enabled"`
+	IntervalSeconds  int64               `json:"interval_seconds"`
+	ScheduleType     db.ScheduleType     `json:"schedule_type"`
+	CronExpr         string              `json:"cron_expr"`
+	LongevityType    db.JobLongevityType `json:"longevity_type"`
+	MaxRuns          int                 `json:"max_runs"`
+	DisableAfter     time.Time           `json:"disable_after"`
+	TargetHostgroups []string            `json:"target_hostgroups"`
+	Actions          []JobActionInput    `json:"actions"`
 }
 
 // NewJobService creates the job business service.
-func NewJobService(repository JobRepository, actions ActionFactory, groups HostGroupProvider, files ActionFileValidator) (service *JobService) {
+func NewJobService(repository JobRepository, actions ActionFactory, groups JobHostProvider, files ActionFileValidator, queue *JobQueue, ansible *GoAnsibleRunner, inventory *AnsibleInventoryWriter, logger *golog.Logger) (service *JobService) {
 	service = &JobService{
 		repository: repository,
 		actions:    actions,
 		groups:     groups,
 		files:      files,
+		queue:      queue,
+		ansible:    ansible,
+		inventory:  inventory,
+		log:        serviceLogger(logger, "[JOBS]", golog.BoldBlue),
 	}
 	return
 }
 
 // EnsureDefaultJobs creates protected built-in job examples if missing.
 func (s *JobService) EnsureDefaultJobs(ctx context.Context) (err error) {
-	var defaults []JobInput = defaultJobInputs()
-	var existing *db.Job
+	var (
+		defaults []JobInput = defaultJobInputs()
+		existing *db.Job
+	)
 
 	for _, input := range defaults {
 		if existing, err = s.repository.GetJobByName(ctx, input.Name); err != nil {
@@ -86,13 +113,42 @@ func (s *JobService) EnsureDefaultJobs(ctx context.Context) (err error) {
 			return
 		}
 
+		if existing != nil && !existing.Protected {
+			continue
+		}
+
 		if existing != nil {
+			if err = s.updateProtectedDefaultJob(ctx, existing, input); err != nil {
+				return
+			}
+
 			continue
 		}
 
 		if _, err = s.createJob(ctx, input, true); err != nil {
 			return
 		}
+	}
+
+	return
+}
+
+// updateProtectedDefaultJob refreshes built-in metadata while preserving operator-controlled settings.
+func (s *JobService) updateProtectedDefaultJob(ctx context.Context, job *db.Job, input JobInput) (err error) {
+	job.Description = strings.TrimSpace(input.Description)
+	job.UpdatedAt = time.Now().UTC()
+
+	if job.LongevityType == db.JobLongevityTypeUnknown {
+		job.LongevityType = normalizeLongevityType(input.LongevityType)
+	}
+
+	if err = s.repository.UpdateJob(ctx, job); err != nil {
+		err = NewPersistenceError("update default job", err)
+		return
+	}
+
+	if err = s.replaceJobActions(ctx, job.ID, input.Actions); err != nil {
+		return
 	}
 
 	return
@@ -112,6 +168,36 @@ func (s *JobService) ListJobs(ctx context.Context) (jobs []db.Job, err error) {
 func (s *JobService) ListJobActions(ctx context.Context, jobID int) (actions []db.JobAction, err error) {
 	if actions, err = s.repository.ListJobActions(ctx, jobID); err != nil {
 		err = NewPersistenceError("list job actions", err)
+		return
+	}
+
+	return
+}
+
+// ListRecentJobRuns returns recent execution records.
+func (s *JobService) ListRecentJobRuns(ctx context.Context, limit int) (runs []db.JobRun, err error) {
+	if runs, err = s.repository.ListRecentJobRuns(ctx, limit); err != nil {
+		err = NewPersistenceError("list recent job runs", err)
+		return
+	}
+
+	return
+}
+
+// ListJobActionRunsByRunIDs returns action-level output for recent runs.
+func (s *JobService) ListJobActionRunsByRunIDs(ctx context.Context, runIDs []int) (runs []db.JobActionRun, err error) {
+	if runs, err = s.repository.ListJobActionRunsByRunIDs(ctx, runIDs); err != nil {
+		err = NewPersistenceError("list job action runs", err)
+		return
+	}
+
+	return
+}
+
+// ListJobHostResultsByRunIDs returns per-host output for recent runs.
+func (s *JobService) ListJobHostResultsByRunIDs(ctx context.Context, runIDs []int) (results []db.JobHostResult, err error) {
+	if results, err = s.repository.ListJobHostResultsByRunIDs(ctx, runIDs); err != nil {
+		err = NewPersistenceError("list job host results", err)
 		return
 	}
 
@@ -158,6 +244,9 @@ func (s *JobService) UpdateJob(ctx context.Context, jobID int, input JobInput) (
 	existing.IntervalSeconds = input.IntervalSeconds
 	existing.ScheduleType = input.ScheduleType
 	existing.CronExpr = strings.TrimSpace(input.CronExpr)
+	existing.LongevityType = normalizeLongevityType(input.LongevityType)
+	existing.MaxRuns = input.MaxRuns
+	existing.DisableAfter = normalizeDisableAfter(input)
 	existing.TargetHostgroups = normalizeStringList(input.TargetHostgroups)
 	existing.UpdatedAt = time.Now().UTC()
 
@@ -180,13 +269,18 @@ func (s *JobService) UpdateJob(ctx context.Context, jobID int, input JobInput) (
 	return
 }
 
-// RunJob runs a job through the configured action framework.
+// RunJob queues a job for worker execution.
 func (s *JobService) RunJob(ctx context.Context, jobID int, triggeredBy string) (run *db.JobRun, err error) {
 	var (
-		job        *db.Job
-		actions    []db.JobAction
-		executable Action
+		job     *db.Job
+		actions []db.JobAction
+		taskID  int
 	)
+
+	if s.queue == nil {
+		err = NewExecutionError("job queue is not configured", nil)
+		return
+	}
 
 	if job, err = s.repository.GetJob(ctx, jobID); err != nil {
 		err = NewPersistenceError("get job", err)
@@ -198,41 +292,312 @@ func (s *JobService) RunJob(ctx context.Context, jobID int, triggeredBy string) 
 		return
 	}
 
+	if len(job.TargetHostgroups) == 0 {
+		err = NewInvalidInputError("job requires at least one target host group before it can run", nil)
+		return
+	}
+
+	if err = s.validateTargetGroups(ctx, job.TargetHostgroups); err != nil {
+		return
+	}
+
 	if actions, err = s.repository.ListJobActions(ctx, job.ID); err != nil {
 		err = NewPersistenceError("list job actions", err)
 		return
 	}
 
+	if len(actions) == 0 {
+		err = NewInvalidInputError("job has no actions", nil)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Queueing job job_id=%d name=%s triggered_by=%s groups=%v actions=%d\n", job.ID, job.Name, triggeredBy, job.TargetHostgroups, len(actions))
+	}
+
 	run = &db.JobRun{
 		JobID:            uint64(job.ID),
-		Status:           db.JobRunStatusRunning,
+		Status:           db.JobRunStatusQueued,
 		TriggerType:      db.JobRunTriggerTypeAPI,
 		TriggeredBy:      triggeredBy,
 		StartTime:        time.Now().UTC(),
 		TargetHostgroups: job.TargetHostgroups,
 	}
 
-	for _, action := range actions {
-		if executable, err = s.actions.NewAction(action); err != nil {
-			run.Status = db.JobRunStatusFailed
-			run.Error = err.Error()
-			run.EndTime = time.Now().UTC()
-			err = NewExecutionError("create action", err)
+	if err = s.repository.InsertJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("insert job run", err)
+		return
+	}
+
+	if taskID, err = s.queue.EnqueueJobRun(ctx, JobRunTaskPayload{
+		JobID:       job.ID,
+		JobRunID:    run.ID,
+		TriggeredBy: triggeredBy,
+		HostGroups:  job.TargetHostgroups,
+	}); err != nil {
+		var updateErr error
+		run.Status = db.JobRunStatusFailed
+		run.Error = err.Error()
+		run.EndTime = time.Now().UTC()
+		if updateErr = s.repository.UpdateJobRun(ctx, run); updateErr != nil {
+			err = NewPersistenceError("update failed job run", updateErr)
 			return
 		}
 
-		if err = executable.Execute(ctx, run); err != nil {
-			run.Status = db.JobRunStatusFailed
-			run.Error = err.Error()
-			run.EndTime = time.Now().UTC()
-			err = NewExecutionError("execute action", err)
+		return
+	}
+
+	run.Summary = fmt.Sprintf("queued as task %d", taskID)
+	if err = s.repository.UpdateJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("update queued job run", err)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Queued job run job_id=%d run_id=%d task_id=%d\n", job.ID, run.ID, taskID)
+	}
+
+	return
+}
+
+// ExecuteQueuedJob executes a queued job run from the Gasket worker.
+func (s *JobService) ExecuteQueuedJob(ctx context.Context, payload JobRunTaskPayload) (data []byte, err error) {
+	var (
+		job       *db.Job
+		run       *db.JobRun
+		actions   []db.JobAction
+		hosts     []db.Host
+		inventory AnsibleInventory
+		groups    []string
+	)
+
+	if s.ansible == nil || s.inventory == nil {
+		err = NewExecutionError("job execution dependencies are not configured", nil)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Worker starting job run job_id=%d run_id=%d triggered_by=%s\n", payload.JobID, payload.JobRunID, payload.TriggeredBy)
+	}
+
+	if run, err = s.repository.GetJobRun(ctx, payload.JobRunID); err != nil {
+		err = NewPersistenceError("get job run", err)
+		return
+	}
+
+	if run == nil {
+		err = NewNotFoundError("job run not found", nil)
+		return
+	}
+
+	if isTerminalJobRunStatus(run.Status) {
+		data = []byte(run.Summary)
+		if len(data) == 0 {
+			data = []byte(run.Error)
+		}
+
+		if s.log != nil {
+			s.log.Infof("Skipping already completed job run job_id=%d run_id=%d status=%d\n", payload.JobID, run.ID, run.Status)
+		}
+
+		return
+	}
+
+	if job, err = s.repository.GetJob(ctx, payload.JobID); err != nil {
+		err = NewPersistenceError("get queued job", err)
+		return
+	}
+
+	if job == nil {
+		err = NewNotFoundError("queued job not found", nil)
+		return
+	}
+
+	if actions, err = s.repository.ListJobActions(ctx, job.ID); err != nil {
+		err = NewPersistenceError("list queued job actions", err)
+		return
+	}
+
+	run.Status = db.JobRunStatusRunning
+	run.StartTime = time.Now().UTC()
+	if err = s.repository.UpdateJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("mark job run running", err)
+		return
+	}
+
+	groups = normalizeStringList(run.TargetHostgroups)
+	if len(groups) == 0 {
+		groups = normalizeStringList(payload.HostGroups)
+	}
+
+	if len(groups) == 0 {
+		groups = normalizeStringList(job.TargetHostgroups)
+	}
+
+	run.TargetHostgroups = groups
+	if s.log != nil {
+		s.log.Infof("Resolving job run targets job_id=%d run_id=%d groups=%v\n", job.ID, run.ID, groups)
+	}
+
+	if hosts, err = s.groups.GetHostsForGroups(ctx, groups); err != nil {
+		err = s.failRun(ctx, run, fmt.Errorf("resolve target hosts: %w", err))
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Resolved job run targets job_id=%d run_id=%d hosts=%d\n", job.ID, run.ID, len(hosts))
+	}
+
+	if inventory, err = s.inventory.WriteJobInventory(ctx, run.ID, hosts); err != nil {
+		err = s.failRun(ctx, run, err)
+		return
+	}
+
+	run.TargetHosts = inventory.Hostnames
+	run.TotalHosts = len(inventory.Hostnames)
+	if err = s.repository.UpdateJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("update job run targets", err)
+		return
+	}
+
+	if err = s.executeActions(ctx, run, actions, inventory); err != nil {
+		return
+	}
+
+	data = []byte(run.Summary)
+	if s.log != nil {
+		s.log.Infof("Worker finished job run job_id=%d run_id=%d status=%d summary=%s\n", job.ID, run.ID, run.Status, run.Summary)
+	}
+
+	return
+}
+
+// executeActions executes each action and updates run status.
+func (s *JobService) executeActions(ctx context.Context, run *db.JobRun, actions []db.JobAction, inventory AnsibleInventory) (err error) {
+	var (
+		actionRun db.JobActionRun
+		output    AnsibleRunOutput
+		actionErr error
+	)
+
+	for _, action := range actions {
+		if s.log != nil {
+			s.log.Infof("Starting job action run_id=%d action_id=%d name=%s type=%d file=%s\n", run.ID, action.ID, action.Name, action.Type, action.FilePath)
+		}
+
+		actionRun = db.JobActionRun{
+			JobRunID:    uint64(run.ID),
+			JobActionID: uint64(action.ID),
+			Status:      db.JobRunStatusRunning,
+			StartTime:   time.Now().UTC(),
+		}
+
+		if err = s.repository.InsertJobActionRun(ctx, &actionRun); err != nil {
+			err = NewPersistenceError("insert job action run", err)
+			return
+		}
+
+		output, actionErr = s.executeAction(ctx, action, inventory)
+		actionRun.Stdout = output.Stdout
+		actionRun.Stderr = output.Stderr
+		actionRun.EndTime = time.Now().UTC()
+		if actionErr != nil {
+			actionRun.Status = db.JobRunStatusFailed
+			actionRun.Error = actionErr.Error()
+			if s.log != nil {
+				s.log.Errorf("Job action failed run_id=%d action_id=%d error=%v\n", run.ID, action.ID, actionErr)
+			}
+		} else {
+			actionRun.Status = db.JobRunStatusSuccess
+			if s.log != nil {
+				s.log.Infof("Job action completed run_id=%d action_id=%d stdout_bytes=%d stderr_bytes=%d\n", run.ID, action.ID, len(output.Stdout), len(output.Stderr))
+			}
+		}
+
+		if err = s.persistActionHostResults(ctx, run, action, output, inventory); err != nil {
+			return
+		}
+
+		if err = s.repository.UpdateJobActionRun(ctx, &actionRun); err != nil {
+			err = NewPersistenceError("update job action run", err)
+			return
+		}
+
+		if actionErr != nil && !action.ContinueOnError {
+			err = s.failRun(ctx, run, actionErr)
 			return
 		}
 	}
 
 	run.Status = db.JobRunStatusSuccess
 	run.EndTime = time.Now().UTC()
-	run.Summary = "mock execution completed"
+	run.SuccessHosts = run.TotalHosts
+	run.FailedHosts = 0
+	run.SkippedHosts = 0
+	run.Summary = fmt.Sprintf("completed %d action(s) across %d host(s)", len(actions), run.TotalHosts)
+	if err = s.repository.UpdateJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("mark job run success", err)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Job run succeeded run_id=%d hosts=%d actions=%d\n", run.ID, run.TotalHosts, len(actions))
+	}
+
+	return
+}
+
+// executeAction dispatches an action through the Ansible runner.
+func (s *JobService) executeAction(ctx context.Context, action db.JobAction, inventory AnsibleInventory) (output AnsibleRunOutput, err error) {
+	var (
+		actionCtx context.Context = ctx
+		cancel    context.CancelFunc
+	)
+
+	if action.TimeoutSeconds > 0 {
+		actionCtx, cancel = context.WithTimeout(ctx, time.Duration(action.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+
+	switch action.Type {
+	case db.JobActionTypeAnsiblePlaybook:
+		output, err = s.ansible.RunPlaybook(actionCtx, AnsibleRunRequest{
+			Action:           action,
+			InventoryPath:    inventory.Path,
+			WorkingDirectory: inventory.WorkDir,
+		})
+	case db.JobActionTypeShell:
+		output, err = s.ansible.RunShellScript(actionCtx, AnsibleRunRequest{
+			Action:           action,
+			InventoryPath:    inventory.Path,
+			WorkingDirectory: inventory.WorkDir,
+		})
+	default:
+		err = NewInvalidInputError("unsupported action type", nil)
+	}
+
+	return
+}
+
+// failRun marks a run failed and persists the failure reason.
+func (s *JobService) failRun(ctx context.Context, run *db.JobRun, runErr error) (err error) {
+	run.Status = db.JobRunStatusFailed
+	run.EndTime = time.Now().UTC()
+	run.FailedHosts = run.TotalHosts
+	run.SuccessHosts = 0
+	run.Error = runErr.Error()
+	run.Summary = "job run failed"
+
+	if err = s.repository.UpdateJobRun(ctx, run); err != nil {
+		err = NewPersistenceError("mark job run failed", err)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Errorf("Job run failed run_id=%d status=%d error=%v\n", run.ID, run.Status, runErr)
+	}
+
+	err = runErr
 	return
 }
 
@@ -255,6 +620,9 @@ func (s *JobService) createJob(ctx context.Context, input JobInput, protected bo
 		IntervalSeconds:  input.IntervalSeconds,
 		ScheduleType:     input.ScheduleType,
 		CronExpr:         strings.TrimSpace(input.CronExpr),
+		LongevityType:    normalizeLongevityType(input.LongevityType),
+		MaxRuns:          input.MaxRuns,
+		DisableAfter:     normalizeDisableAfter(input),
 		TargetHostgroups: normalizeStringList(input.TargetHostgroups),
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -316,6 +684,10 @@ func (s *JobService) validateJobFields(ctx context.Context, input JobInput) (err
 		return
 	}
 
+	if err = validateLongevity(input); err != nil {
+		return
+	}
+
 	if input.Enabled {
 		if err = s.validateTargetGroups(ctx, input.TargetHostgroups); err != nil {
 			return
@@ -325,31 +697,81 @@ func (s *JobService) validateJobFields(ctx context.Context, input JobInput) (err
 	return
 }
 
-// replaceJobActions replaces custom job actions in execution order.
-func (s *JobService) replaceJobActions(ctx context.Context, jobID int, actions []JobActionInput) (err error) {
-	var action db.JobAction
+// validateLongevity checks auto-disable settings.
+func validateLongevity(input JobInput) (err error) {
+	switch normalizeLongevityType(input.LongevityType) {
+	case db.JobLongevityTypePermanent:
+	case db.JobLongevityTypeMaxRuns:
+		if input.MaxRuns <= 0 {
+			err = NewInvalidInputError("run-limited jobs require max_runs", nil)
+			return
+		}
+	case db.JobLongevityTypeUntil:
+		if input.DisableAfter.IsZero() {
+			err = NewInvalidInputError("date-limited jobs require disable_after", nil)
+			return
+		}
 
-	if err = s.repository.DeleteJobActions(ctx, jobID); err != nil {
-		err = NewPersistenceError("delete job actions", err)
+		if !input.DisableAfter.After(time.Now().UTC()) {
+			err = NewInvalidInputError("disable_after must be in the future", nil)
+			return
+		}
+	default:
+		err = NewInvalidInputError("unsupported longevity type", nil)
+	}
+
+	return
+}
+
+// replaceJobActions updates job actions in execution order while preserving run history links.
+func (s *JobService) replaceJobActions(ctx context.Context, jobID int, actions []JobActionInput) (err error) {
+	var (
+		existing []db.JobAction
+		action   db.JobAction
+	)
+
+	if existing, err = s.repository.ListJobActions(ctx, jobID); err != nil {
+		err = NewPersistenceError("list job actions", err)
 		return
 	}
 
 	for position, inputAction := range actions {
-		action = db.JobAction{
-			JobID:           uint64(jobID),
-			Position:        position + 1,
-			Name:            strings.TrimSpace(inputAction.Name),
-			Description:     strings.TrimSpace(inputAction.Description),
-			Type:            inputAction.Type,
-			FilePath:        strings.TrimSpace(inputAction.FilePath),
-			Arguments:       normalizeStringList(inputAction.Arguments),
-			ContinueOnError: inputAction.ContinueOnError,
-			TimeoutSeconds:  inputAction.TimeoutSeconds,
+		if position < len(existing) {
+			action = existing[position]
+		} else {
+			action = db.JobAction{JobID: uint64(jobID)}
+		}
+
+		action.Position = position + 1
+		action.Name = strings.TrimSpace(inputAction.Name)
+		action.Description = strings.TrimSpace(inputAction.Description)
+		action.Type = inputAction.Type
+		action.FilePath = strings.TrimSpace(inputAction.FilePath)
+		action.Arguments = normalizeStringList(inputAction.Arguments)
+		action.ContinueOnError = inputAction.ContinueOnError
+		action.TimeoutSeconds = inputAction.TimeoutSeconds
+
+		if action.ID > 0 {
+			if err = s.repository.UpdateJobAction(ctx, &action); err != nil {
+				err = NewPersistenceError("update job action", err)
+				return
+			}
+
+			continue
 		}
 
 		if err = s.repository.InsertJobAction(ctx, &action); err != nil {
 			err = NewPersistenceError("insert job action", err)
 			return
+		}
+	}
+
+	if len(existing) > len(actions) {
+		for _, action = range existing[len(actions):] {
+			if err = s.repository.DeleteJobAction(ctx, action.ID); err != nil {
+				err = NewPersistenceError("delete job action", err)
+				return
+			}
 		}
 	}
 
@@ -440,13 +862,26 @@ func defaultJobInputs() (jobs []JobInput) {
 	jobs = []JobInput{
 		{
 			Name:             "Health",
-			Description:      "Every minute, check SSH connectivity and poll usage, uptime, and users.",
+			Description:      "For online systems, checks usage and system health, then reports major warnings.",
 			Enabled:          false,
-			IntervalSeconds:  60,
+			IntervalSeconds:  300,
 			ScheduleType:     db.ScheduleTypeInterval,
+			LongevityType:    db.JobLongevityTypePermanent,
 			TargetHostgroups: []string{},
 			Actions: []JobActionInput{
 				defaultAnsibleAction("Health playbook", "playbooks/health.yml"),
+			},
+		},
+		{
+			Name:             "Heartbeat",
+			Description:      "Checks login to online systems and enumerates uptime and online users.",
+			Enabled:          false,
+			IntervalSeconds:  60,
+			ScheduleType:     db.ScheduleTypeInterval,
+			LongevityType:    db.JobLongevityTypePermanent,
+			TargetHostgroups: []string{},
+			Actions: []JobActionInput{
+				defaultAnsibleAction("Heartbeat playbook", "playbooks/heartbeat.yml"),
 			},
 		},
 		{
@@ -455,6 +890,7 @@ func defaultJobInputs() (jobs []JobInput) {
 			Enabled:          false,
 			ScheduleType:     db.ScheduleTypeCron,
 			CronExpr:         "0 0 * * 0",
+			LongevityType:    db.JobLongevityTypePermanent,
 			TargetHostgroups: []string{},
 			Actions: []JobActionInput{
 				defaultAnsibleAction("Inventory playbook", "playbooks/inventory.yml"),
@@ -466,12 +902,38 @@ func defaultJobInputs() (jobs []JobInput) {
 			Enabled:          false,
 			ScheduleType:     db.ScheduleTypeCron,
 			CronExpr:         "0 5 * * 1",
+			LongevityType:    db.JobLongevityTypePermanent,
 			TargetHostgroups: []string{},
 			Actions: []JobActionInput{
 				defaultAnsibleAction("Software update playbook", "playbooks/software-update.yml"),
 			},
 		},
 	}
+	return
+}
+
+// normalizeLongevityType maps unset longevity to permanent.
+func normalizeLongevityType(longevityType db.JobLongevityType) (normalized db.JobLongevityType) {
+	normalized = longevityType
+	if normalized == db.JobLongevityTypeUnknown {
+		normalized = db.JobLongevityTypePermanent
+	}
+
+	return
+}
+
+// isTerminalJobRunStatus reports run states that should never execute again.
+func isTerminalJobRunStatus(status db.JobRunStatus) (terminal bool) {
+	terminal = status == db.JobRunStatusSuccess || status == db.JobRunStatusFailed
+	return
+}
+
+// normalizeDisableAfter keeps date limits only when the job uses them.
+func normalizeDisableAfter(input JobInput) (disableAfter time.Time) {
+	if normalizeLongevityType(input.LongevityType) == db.JobLongevityTypeUntil {
+		disableAfter = input.DisableAfter.UTC()
+	}
+
 	return
 }
 

@@ -1,5 +1,5 @@
 import cronstrue from "cronstrue";
-import type { Job } from "../api/types";
+import type { Job, JobRun } from "../api/types";
 
 export function formatSchedule(job: Job): string {
     switch (job.schedule_type) {
@@ -70,6 +70,45 @@ export function scheduleTone(job: Job): "neutral" | "success" | "warning" | "dan
 
 export function jobEnabledTone(enabled: boolean): "success" | "neutral" {
     return enabled ? "success" : "neutral";
+}
+
+export function jobRunStatusLabel(run: JobRun): string {
+    switch (run.status) {
+        case 1:
+            return "Queued";
+        case 2:
+            return "Running";
+        case 3:
+            return "Success";
+        case 4:
+            return "Failed";
+        case 5:
+            return "Partial";
+        case 6:
+            return "Canceled";
+        case 7:
+            return "Timeout";
+        default:
+            return "Unknown";
+    }
+}
+
+export function jobRunStatusTone(run: JobRun): "neutral" | "success" | "warning" | "danger" | "info" {
+    switch (run.status) {
+        case 1:
+        case 2:
+            return "info";
+        case 3:
+            return "success";
+        case 4:
+        case 7:
+            return "danger";
+        case 5:
+        case 6:
+            return "warning";
+        default:
+            return "neutral";
+    }
 }
 
 export function formatDateTime(value: string): string {
