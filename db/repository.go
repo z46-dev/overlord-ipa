@@ -78,6 +78,29 @@ func (r *Repository) CountJobRunsByJobID(ctx context.Context, jobID int) (count 
 	return
 }
 
+// CountActiveJobRunsByJobID returns queued or running runs for a job.
+func (r *Repository) CountActiveJobRunsByJobID(ctx context.Context, jobID int) (count int64, err error) {
+	if err = ctx.Err(); err != nil {
+		return
+	}
+
+	if jobID <= 0 {
+		err = fmt.Errorf("job id must be positive")
+		return
+	}
+
+	if count, err = JobRuns.CountWithFilter(
+		gosqlite.NewFilter().
+			KeyCmp(JobRuns.FieldByGoName("JobID"), gosqlite.OpEqual, uint64(jobID)).
+			And().
+			KeyCmp(JobRuns.FieldByGoName("Status"), gosqlite.OpIn, []JobRunStatus{JobRunStatusQueued, JobRunStatusRunning}),
+	); err != nil {
+		return
+	}
+
+	return
+}
+
 // GetHostByFQDN returns a host inventory row by FQDN.
 func (r *Repository) GetHostByFQDN(ctx context.Context, fqdn string) (host *Host, err error) {
 	var rows []*Host

@@ -135,7 +135,11 @@ func (s *JobService) EnsureDefaultJobs(ctx context.Context) (err error) {
 
 // updateProtectedDefaultJob refreshes built-in metadata while preserving operator-controlled settings.
 func (s *JobService) updateProtectedDefaultJob(ctx context.Context, job *db.Job, input JobInput) (err error) {
+	input = normalizeJobInput(input)
 	job.Description = strings.TrimSpace(input.Description)
+	job.IntervalSeconds = 0
+	job.ScheduleType = input.ScheduleType
+	job.CronExpr = strings.TrimSpace(input.CronExpr)
 	job.UpdatedAt = time.Now().UTC()
 
 	if job.LongevityType == db.JobLongevityTypeUnknown {
@@ -206,6 +210,7 @@ func (s *JobService) ListJobHostResultsByRunIDs(ctx context.Context, runIDs []in
 
 // CreateJob validates and persists a new custom job.
 func (s *JobService) CreateJob(ctx context.Context, input JobInput) (job *db.Job, err error) {
+	input = normalizeJobInput(input)
 	job, err = s.createJob(ctx, input, false)
 	return
 }
@@ -213,6 +218,7 @@ func (s *JobService) CreateJob(ctx context.Context, input JobInput) (job *db.Job
 // UpdateJob validates and persists an existing job.
 func (s *JobService) UpdateJob(ctx context.Context, jobID int, input JobInput) (job *db.Job, err error) {
 	var existing *db.Job
+	input = normalizeJobInput(input)
 
 	if existing, err = s.repository.GetJob(ctx, jobID); err != nil {
 		err = NewPersistenceError("get job", err)
@@ -241,7 +247,7 @@ func (s *JobService) UpdateJob(ctx context.Context, jobID int, input JobInput) (
 
 	existing.Description = strings.TrimSpace(input.Description)
 	existing.Enabled = input.Enabled
-	existing.IntervalSeconds = input.IntervalSeconds
+	existing.IntervalSeconds = 0
 	existing.ScheduleType = input.ScheduleType
 	existing.CronExpr = strings.TrimSpace(input.CronExpr)
 	existing.LongevityType = normalizeLongevityType(input.LongevityType)
@@ -269,8 +275,19 @@ func (s *JobService) UpdateJob(ctx context.Context, jobID int, input JobInput) (
 	return
 }
 
-// RunJob queues a job for worker execution.
+// RunJob queues a manually-triggered job for worker execution.
 func (s *JobService) RunJob(ctx context.Context, jobID int, triggeredBy string) (run *db.JobRun, err error) {
+	run, err = s.runJob(ctx, jobID, triggeredBy, db.JobRunTriggerTypeManual)
+	return
+}
+
+// RunScheduledJob queues a scheduler-triggered job for worker execution.
+func (s *JobService) RunScheduledJob(ctx context.Context, jobID int) (run *db.JobRun, err error) {
+	run, err = s.runJob(ctx, jobID, "scheduler", db.JobRunTriggerTypeSchedule)
+	return
+}
+
+func (s *JobService) runJob(ctx context.Context, jobID int, triggeredBy string, triggerType db.JobRunTriggerType) (run *db.JobRun, err error) {
 	var (
 		job     *db.Job
 		actions []db.JobAction
@@ -318,7 +335,7 @@ func (s *JobService) RunJob(ctx context.Context, jobID int, triggeredBy string) 
 	run = &db.JobRun{
 		JobID:            uint64(job.ID),
 		Status:           db.JobRunStatusQueued,
-		TriggerType:      db.JobRunTriggerTypeAPI,
+		TriggerType:      triggerType,
 		TriggeredBy:      triggeredBy,
 		StartTime:        time.Now().UTC(),
 		TargetHostgroups: job.TargetHostgroups,
@@ -607,6 +624,7 @@ func (s *JobService) createJob(ctx context.Context, input JobInput, protected bo
 		now    time.Time = time.Now().UTC()
 		action db.JobAction
 	)
+	input = normalizeJobInput(input)
 
 	if err = s.validateJobInput(ctx, input); err != nil {
 		return
@@ -617,7 +635,7 @@ func (s *JobService) createJob(ctx context.Context, input JobInput, protected bo
 		Description:      strings.TrimSpace(input.Description),
 		Enabled:          input.Enabled,
 		Protected:        protected,
-		IntervalSeconds:  input.IntervalSeconds,
+		IntervalSeconds:  0,
 		ScheduleType:     input.ScheduleType,
 		CronExpr:         strings.TrimSpace(input.CronExpr),
 		LongevityType:    normalizeLongevityType(input.LongevityType),
@@ -781,19 +799,32 @@ func (s *JobService) replaceJobActions(ctx context.Context, jobID int, actions [
 // validateSchedule checks schedule-specific required fields.
 func validateSchedule(input JobInput) (err error) {
 	switch input.ScheduleType {
-	case db.ScheduleTypeInterval:
-		if input.IntervalSeconds <= 0 {
-			err = NewInvalidInputError("interval jobs require interval_seconds", nil)
-			return
-		}
 	case db.ScheduleTypeCron:
 		if strings.TrimSpace(input.CronExpr) == "" {
 			err = NewInvalidInputError("cron jobs require cron_expr", nil)
 			return
 		}
+		if _, err = parseCronSchedule(input.CronExpr); err != nil {
+			err = NewInvalidInputError(fmt.Sprintf("invalid cron expression: %v", err), nil)
+			return
+		}
 	case db.ScheduleTypeManual:
 	default:
 		err = NewInvalidInputError("unsupported schedule type", nil)
+	}
+
+	return
+}
+
+func normalizeJobInput(input JobInput) (normalized JobInput) {
+	normalized = input
+	if normalized.ScheduleType == db.ScheduleTypeInterval {
+		normalized.ScheduleType = db.ScheduleTypeCron
+		normalized.CronExpr = intervalSecondsToCron(normalized.IntervalSeconds)
+	}
+
+	if normalized.ScheduleType == db.ScheduleTypeCron {
+		normalized.IntervalSeconds = 0
 	}
 
 	return
@@ -864,8 +895,8 @@ func defaultJobInputs() (jobs []JobInput) {
 			Name:             "Health",
 			Description:      "For online systems, checks usage and system health, then reports major warnings.",
 			Enabled:          false,
-			IntervalSeconds:  300,
-			ScheduleType:     db.ScheduleTypeInterval,
+			ScheduleType:     db.ScheduleTypeCron,
+			CronExpr:         "0 */5 * * * *",
 			LongevityType:    db.JobLongevityTypePermanent,
 			TargetHostgroups: []string{},
 			Actions: []JobActionInput{
@@ -876,8 +907,8 @@ func defaultJobInputs() (jobs []JobInput) {
 			Name:             "Heartbeat",
 			Description:      "Checks login to online systems and enumerates uptime and online users.",
 			Enabled:          false,
-			IntervalSeconds:  60,
-			ScheduleType:     db.ScheduleTypeInterval,
+			ScheduleType:     db.ScheduleTypeCron,
+			CronExpr:         "0 * * * * *",
 			LongevityType:    db.JobLongevityTypePermanent,
 			TargetHostgroups: []string{},
 			Actions: []JobActionInput{

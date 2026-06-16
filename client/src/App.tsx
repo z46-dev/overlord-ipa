@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useState } from "react";
-import { getCurrentUser, login, logout } from "./api/client";
+import { useEffect, useState } from "react";
+import { getCurrentUser, logout } from "./api/client";
 import type { AuthenticatedUser } from "./api/types";
 import { Data } from "./pages/Data";
 import { Dashboard } from "./pages/Dashboard";
@@ -8,18 +8,25 @@ import { Jobs } from "./pages/Jobs";
 
 type Page = "dashboard" | "hosts" | "jobs" | "data";
 
-const navItems: Array<{ id: Page; label: string }> = [
-    { id: "dashboard", label: "Dashboard" },
-    { id: "hosts", label: "Hosts" },
-    { id: "jobs", label: "Jobs" },
-    { id: "data", label: "Data" }
+interface AppRoute {
+    page: Page;
+    jobID: number | null;
+    shouldReplace: boolean;
+}
+
+const navItems: Array<{ id: Page; label: string; path: string }> = [
+    { id: "dashboard", label: "Dashboard", path: "/dashboard" },
+    { id: "hosts", label: "Hosts", path: "/hosts" },
+    { id: "jobs", label: "Jobs", path: "/jobs" },
+    { id: "data", label: "Data", path: "/data" }
 ];
 
 export function App() {
-    const [page, setPage] = useState<Page>("dashboard");
+    const initialRoute = routeFromLocation();
+    const [route, setRoute] = useState<AppRoute>(initialRoute);
     const [user, setUser] = useState<AuthenticatedUser | null>(null);
-    const [loadingUser, setLoadingUser] = useState(true);
-    const [jobToOpen, setJobToOpen] = useState<number | null>(null);
+    const [checkingUser, setCheckingUser] = useState(true);
+    const [jobToOpen, setJobToOpen] = useState<number | null>(initialRoute.jobID);
 
     useEffect(() => {
         let mounted = true;
@@ -37,7 +44,7 @@ export function App() {
             })
             .finally(() => {
                 if (mounted) {
-                    setLoadingUser(false);
+                    setCheckingUser(false);
                 }
             });
 
@@ -46,31 +53,73 @@ export function App() {
         };
     }, []);
 
+    useEffect(() => {
+        const handlePopState = () => {
+            const nextRoute = routeFromLocation();
+            setRoute(nextRoute);
+            setJobToOpen(nextRoute.jobID);
+        };
+
+        window.addEventListener("popstate", handlePopState);
+        return () => {
+            window.removeEventListener("popstate", handlePopState);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (checkingUser || !user) {
+            return;
+        }
+
+        if (route.shouldReplace) {
+            navigate(route, true);
+            return;
+        }
+
+        if (route.page === "data" && !user.can_edit) {
+            navigate({ page: "dashboard", jobID: null, shouldReplace: false }, true);
+        }
+    }, [checkingUser, user, route]);
+
+    const navigate = (nextRoute: AppRoute, replace = false) => {
+        const path = pathForRoute(nextRoute);
+        const normalizedRoute: AppRoute = { ...nextRoute, shouldReplace: false };
+
+        setRoute(normalizedRoute);
+        setJobToOpen(nextRoute.jobID);
+
+        if (replace) {
+            window.history.replaceState(null, "", path);
+            return;
+        }
+
+        if (window.location.pathname !== path) {
+            window.history.pushState(null, "", path);
+        }
+    };
+
     const handleLogout = () => {
         logout().finally(() => {
             setUser(null);
-            setPage("dashboard");
+            navigate({ page: "dashboard", jobID: null, shouldReplace: false }, true);
             setJobToOpen(null);
         });
     };
 
     const openJob = (jobID: number) => {
-        setJobToOpen(jobID);
-        setPage("jobs");
+        navigate({ page: "jobs", jobID, shouldReplace: false });
     };
 
-    if (loadingUser) {
-        return (
-            <div className="flex min-h-screen items-center justify-center bg-[#f5f5f5] text-sm text-[#6b7280]">
-                Loading
-            </div>
-        );
+    if (checkingUser) {
+        return null;
     }
 
     if (!user) {
-        return <LoginScreen onLogin={setUser} />;
+        window.location.replace("/login");
+        return null;
     }
 
+    const page = route.page;
     const visibleNavItems = user.can_edit ? navItems : navItems.filter((item) => item.id !== "data");
 
     return (
@@ -101,7 +150,7 @@ export function App() {
                                     : "border-transparent text-[#1f2933] hover:border-[#d1d5db] hover:bg-[#eef0f2]"
                             }`}
                             type="button"
-                            onClick={() => setPage(item.id)}
+                            onClick={() => navigate({ page: item.id, jobID: null, shouldReplace: false })}
                         >
                             {item.label}
                         </button>
@@ -116,7 +165,19 @@ export function App() {
                 <div className="p-5">
                     {page === "dashboard" ? <Dashboard onOpenJob={openJob} /> : null}
                     {page === "hosts" ? <Hosts canEdit={user.can_edit} /> : null}
-                    {page === "jobs" ? <Jobs canEdit={user.can_edit} openJobID={jobToOpen} onOpenJobHandled={() => setJobToOpen(null)} /> : null}
+                    {page === "jobs" ? (
+                        <Jobs
+                            canEdit={user.can_edit}
+                            openJobID={jobToOpen}
+                            onJobClosed={() => {
+                                if (route.jobID !== null) {
+                                    navigate({ page: "jobs", jobID: null, shouldReplace: false }, true);
+                                }
+                            }}
+                            onJobSelected={(jobID) => navigate({ page: "jobs", jobID, shouldReplace: false })}
+                            onOpenJobHandled={() => setJobToOpen(null)}
+                        />
+                    ) : null}
                     {page === "data" ? <Data canEdit={user.can_edit} /> : null}
                 </div>
             </main>
@@ -124,75 +185,43 @@ export function App() {
     );
 }
 
-function LoginScreen({ onLogin }: { onLogin: (user: AuthenticatedUser) => void }) {
-    const [error, setError] = useState("");
-    const [submitting, setSubmitting] = useState(false);
+function routeFromLocation(): AppRoute {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    const parts = path.split("/").filter(Boolean);
 
-    const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-        const formData = new FormData(event.currentTarget);
-        const username = String(formData.get("username") ?? "");
-        const password = String(formData.get("password") ?? "");
+    if (parts.length === 0) {
+        return { page: "dashboard", jobID: null, shouldReplace: true };
+    }
 
-        event.preventDefault();
-        setError("");
-        setSubmitting(true);
+    if (parts.length === 1) {
+        switch (parts[0]) {
+            case "dashboard":
+                return { page: "dashboard", jobID: null, shouldReplace: false };
+            case "hosts":
+                return { page: "hosts", jobID: null, shouldReplace: false };
+            case "jobs":
+                return { page: "jobs", jobID: null, shouldReplace: false };
+            case "data":
+                return { page: "data", jobID: null, shouldReplace: false };
+            default:
+                return { page: "dashboard", jobID: null, shouldReplace: true };
+        }
+    }
 
-        login({ username, password })
-            .then(onLogin)
-            .catch((err: unknown) => {
-                setError(err instanceof Error ? err.message : "Login failed");
-            })
-            .finally(() => {
-                setSubmitting(false);
-            });
-    };
+    if (parts.length === 2 && parts[0] === "jobs") {
+        const jobID = Number(parts[1]);
+        if (Number.isInteger(jobID) && jobID > 0) {
+            return { page: "jobs", jobID, shouldReplace: false };
+        }
+    }
 
-    return (
-        <div className="min-h-screen bg-[#f5f5f5] text-[#1f2933]">
-            <header className="border-b border-[#1f2327] bg-[#2b2f33] text-white">
-                <div className="flex h-12 items-center px-5">
-                    <div className="text-sm font-semibold">Overlord IPA</div>
-                    <div className="ml-6 text-xs text-gray-300">Infrastructure automation</div>
-                </div>
-            </header>
+    return { page: "dashboard", jobID: null, shouldReplace: true };
+}
 
-            <main className="mx-auto mt-16 w-full max-w-md rounded border border-[#d1d5db] bg-white">
-                <div className="border-b border-[#d1d5db] px-4 py-3">
-                    <h1 className="text-base font-semibold">Log in with FreeIPA</h1>
-                </div>
-                <form className="space-y-4 p-4" action="/api/auth/login" autoComplete="on" method="post" onSubmit={handleSubmit}>
-                    {error ? <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div> : null}
-                    <label className="block text-sm font-medium" htmlFor="username">
-                        Username
-                        <input
-                            id="username"
-                            name="username"
-                            className="mt-1 w-full rounded-sm border border-[#d1d5db] px-3 py-2 text-sm outline-none focus:border-[#1f6fb2]"
-                            autoComplete="username"
-                            autoCapitalize="none"
-                            spellCheck={false}
-                            type="text"
-                        />
-                    </label>
-                    <label className="block text-sm font-medium" htmlFor="password">
-                        Password
-                        <input
-                            id="password"
-                            name="password"
-                            className="mt-1 w-full rounded-sm border border-[#d1d5db] px-3 py-2 text-sm outline-none focus:border-[#1f6fb2]"
-                            autoComplete="current-password"
-                            type="password"
-                        />
-                    </label>
-                    <button
-                        className="w-full rounded-sm bg-[#1f6fb2] px-3 py-2 text-sm font-medium text-white hover:bg-[#155a96] disabled:cursor-not-allowed disabled:bg-[#9ca3af]"
-                        disabled={submitting}
-                        type="submit"
-                    >
-                        {submitting ? "Signing in" : "Sign in"}
-                    </button>
-                </form>
-            </main>
-        </div>
-    );
+function pathForRoute(route: AppRoute): string {
+    if (route.page === "jobs" && route.jobID !== null) {
+        return `/jobs/${route.jobID}`;
+    }
+
+    return navItems.find((item) => item.id === route.page)?.path ?? "/dashboard";
 }

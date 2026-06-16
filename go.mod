@@ -6,6 +6,7 @@ require (
 	github.com/apenella/go-ansible/v2 v2.4.1
 	github.com/go-ldap/ldap/v3 v3.4.13
 	github.com/gofiber/fiber/v3 v3.3.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/z46-dev/gasket v0.0.0-20260613023428-e7bb148beb6e
 	github.com/z46-dev/goconf v0.0.0-20260527232714-5c4e1d4a89e7
 	github.com/z46-dev/golog v0.0.0-20260324172018-d1a87bbdeb64

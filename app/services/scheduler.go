@@ -2,9 +2,13 @@ package services
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/robfig/cron/v3"
+	"github.com/z46-dev/golog"
 	"github.com/z46-dev/overlord-ipa/db"
 )
 
@@ -12,23 +16,11 @@ type SchedulerRepository interface {
 	ListEnabledJobs(ctx context.Context) ([]db.Job, error)
 	UpdateJob(ctx context.Context, job *db.Job) error
 	CountJobRunsByJobID(ctx context.Context, jobID int) (int64, error)
+	CountActiveJobRunsByJobID(ctx context.Context, jobID int) (int64, error)
 }
 
-type Executor interface {
-	RunJob(job db.Job) error
-}
-
-type MockExecutor struct{}
-
-// NewMockExecutor creates a placeholder executor.
-func NewMockExecutor() (executor *MockExecutor) {
-	executor = &MockExecutor{}
-	return
-}
-
-// RunJob accepts a scheduled job without executing it yet.
-func (e *MockExecutor) RunJob(job db.Job) (err error) {
-	return
+type ScheduledJobRunner interface {
+	RunScheduledJob(ctx context.Context, jobID int) (*db.JobRun, error)
 }
 
 type ScheduledJob struct {
@@ -41,6 +33,12 @@ type ScheduledJob struct {
 	MaxRuns         int                 `json:"max_runs"`
 	DisableAfter    time.Time           `json:"disable_after"`
 	Enabled         bool                `json:"enabled"`
+	NextRunAt       time.Time           `json:"next_run_at"`
+}
+
+type scheduledEntry struct {
+	job      ScheduledJob
+	schedule cron.Schedule
 }
 
 type SchedulerSnapshot struct {
@@ -49,26 +47,31 @@ type SchedulerSnapshot struct {
 
 type Scheduler struct {
 	repository SchedulerRepository
-	executor   Executor
+	runner     ScheduledJobRunner
+	log        *golog.Logger
 	mu         sync.RWMutex
-	jobs       []ScheduledJob
+	jobs       []scheduledEntry
 }
 
-// NewScheduler creates a scheduler service.
-func NewScheduler(repository SchedulerRepository, executor Executor) (scheduler *Scheduler) {
+// NewScheduler creates a cron-backed scheduler service.
+func NewScheduler(repository SchedulerRepository, runner ScheduledJobRunner, logger *golog.Logger) (scheduler *Scheduler) {
 	scheduler = &Scheduler{
 		repository: repository,
-		executor:   executor,
+		runner:     runner,
+		log:        serviceLogger(logger, "[SCHEDULER]", golog.BoldPurple),
 	}
 	return
 }
 
-// Load reads enabled jobs into the scheduler snapshot.
+// Load reads enabled cron jobs into the scheduler.
 func (s *Scheduler) Load(ctx context.Context) (err error) {
 	var (
 		jobs       []db.Job
-		scheduled  []ScheduledJob
+		scheduled  []scheduledEntry
 		disableJob bool
+		expr       string
+		schedule   cron.Schedule
+		now        time.Time = time.Now().UTC()
 	)
 
 	if jobs, err = s.repository.ListEnabledJobs(ctx); err != nil {
@@ -76,7 +79,7 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 		return
 	}
 
-	scheduled = make([]ScheduledJob, 0, len(jobs))
+	scheduled = make([]scheduledEntry, 0, len(jobs))
 	for _, job := range jobs {
 		if disableJob, _, err = s.shouldDisable(ctx, job); err != nil {
 			return
@@ -84,7 +87,7 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 
 		if disableJob {
 			job.Enabled = false
-			job.UpdatedAt = time.Now().UTC()
+			job.UpdatedAt = now
 			if err = s.repository.UpdateJob(ctx, &job); err != nil {
 				err = NewPersistenceError("disable expired job", err)
 				return
@@ -93,27 +96,151 @@ func (s *Scheduler) Load(ctx context.Context) (err error) {
 			continue
 		}
 
-		if !isSchedulable(job) {
+		if job.ScheduleType == db.ScheduleTypeInterval {
+			expr = intervalSecondsToCron(job.IntervalSeconds)
+		} else {
+			expr = strings.TrimSpace(job.CronExpr)
+		}
+
+		if job.ScheduleType == db.ScheduleTypeManual || expr == "" {
 			continue
 		}
 
-		scheduled = append(scheduled, ScheduledJob{
-			ID:              job.ID,
-			Name:            job.Name,
-			ScheduleType:    job.ScheduleType,
-			IntervalSeconds: job.IntervalSeconds,
-			CronExpr:        job.CronExpr,
-			LongevityType:   normalizeScheduledLongevity(job.LongevityType),
-			MaxRuns:         job.MaxRuns,
-			DisableAfter:    job.DisableAfter,
-			Enabled:         job.Enabled,
+		if schedule, err = parseCronSchedule(expr); err != nil {
+			if s.log != nil {
+				s.log.Errorf("Skipping job with invalid cron job_id=%d name=%s cron=%q error=%v\n", job.ID, job.Name, expr, err)
+			}
+			continue
+		}
+
+		scheduled = append(scheduled, scheduledEntry{
+			job: ScheduledJob{
+				ID:              job.ID,
+				Name:            job.Name,
+				ScheduleType:    db.ScheduleTypeCron,
+				IntervalSeconds: 0,
+				CronExpr:        expr,
+				LongevityType:   normalizeScheduledLongevity(job.LongevityType),
+				MaxRuns:         job.MaxRuns,
+				DisableAfter:    job.DisableAfter,
+				Enabled:         job.Enabled,
+				NextRunAt:       schedule.Next(now),
+			},
+			schedule: schedule,
 		})
 	}
 
 	s.mu.Lock()
 	s.jobs = scheduled
 	s.mu.Unlock()
+
+	if s.log != nil {
+		s.log.Infof("Loaded %d scheduled job(s)\n", len(scheduled))
+	}
 	return
+}
+
+// Run starts the scheduler loop until the context is canceled.
+func (s *Scheduler) Run(ctx context.Context) (err error) {
+	var ticker *time.Ticker = time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	if s.log != nil {
+		s.log.Info("Starting scheduler\n")
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			if s.log != nil {
+				s.log.Info("Stopped scheduler\n")
+			}
+			err = ctx.Err()
+			return
+		case now := <-ticker.C:
+			s.runDue(ctx, now.UTC())
+		}
+	}
+}
+
+func (s *Scheduler) runDue(ctx context.Context, now time.Time) {
+	var due []scheduledEntry
+
+	s.mu.RLock()
+	for _, entry := range s.jobs {
+		if !entry.job.NextRunAt.IsZero() && !entry.job.NextRunAt.After(now) {
+			due = append(due, entry)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, entry := range due {
+		s.runOne(ctx, entry, now)
+	}
+}
+
+func (s *Scheduler) runOne(ctx context.Context, entry scheduledEntry, now time.Time) {
+	var (
+		active int64
+		err    error
+	)
+
+	if active, err = s.repository.CountActiveJobRunsByJobID(ctx, entry.job.ID); err != nil {
+		if s.log != nil {
+			s.log.Errorf("Unable to check active runs job_id=%d: %v\n", entry.job.ID, err)
+		}
+		s.advance(entry.job.ID, entry.schedule, now)
+		return
+	}
+
+	if active > 0 {
+		if s.log != nil {
+			s.log.Infof("Skipping scheduled job with active run job_id=%d name=%s active=%d\n", entry.job.ID, entry.job.Name, active)
+		}
+		s.advance(entry.job.ID, entry.schedule, now)
+		return
+	}
+
+	if s.runner == nil {
+		if s.log != nil {
+			s.log.Errorf("Scheduler runner is not configured job_id=%d\n", entry.job.ID)
+		}
+		s.advance(entry.job.ID, entry.schedule, now)
+		return
+	}
+
+	if _, err = s.runner.RunScheduledJob(ctx, entry.job.ID); err != nil {
+		if s.log != nil {
+			s.log.Errorf("Scheduled job enqueue failed job_id=%d name=%s: %v\n", entry.job.ID, entry.job.Name, err)
+		}
+		s.advance(entry.job.ID, entry.schedule, now)
+		return
+	}
+
+	if s.log != nil {
+		s.log.Infof("Scheduled job enqueued job_id=%d name=%s\n", entry.job.ID, entry.job.Name)
+	}
+
+	if err = s.Load(ctx); err != nil {
+		if s.log != nil {
+			s.log.Errorf("Scheduler reload failed after enqueue job_id=%d: %v\n", entry.job.ID, err)
+		}
+		s.advance(entry.job.ID, entry.schedule, now)
+	}
+}
+
+func (s *Scheduler) advance(jobID int, schedule cron.Schedule, now time.Time) {
+	nextRunAt := schedule.Next(now)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for index := range s.jobs {
+		if s.jobs[index].job.ID == jobID {
+			s.jobs[index].job.NextRunAt = nextRunAt
+			return
+		}
+	}
 }
 
 // shouldDisable reports whether a job reached its longevity limit.
@@ -145,8 +272,10 @@ func (s *Scheduler) Snapshot() (snapshot SchedulerSnapshot) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var jobs []ScheduledJob = make([]ScheduledJob, len(s.jobs))
-	copy(jobs, s.jobs)
+	jobs := make([]ScheduledJob, 0, len(s.jobs))
+	for _, entry := range s.jobs {
+		jobs = append(jobs, entry.job)
+	}
 	snapshot = SchedulerSnapshot{LoadedJobs: jobs}
 	return
 }
@@ -161,18 +290,22 @@ func normalizeScheduledLongevity(longevityType db.JobLongevityType) (normalized 
 	return
 }
 
-// isSchedulable reports whether a job has enough schedule data.
-func isSchedulable(job db.Job) (ok bool) {
-	switch job.ScheduleType {
-	case db.ScheduleTypeInterval:
-		ok = job.IntervalSeconds > 0
-	case db.ScheduleTypeCron:
-		ok = job.CronExpr != ""
-	case db.ScheduleTypeManual:
-		ok = true
-	default:
-		ok = false
-	}
+func parseCronSchedule(expression string) (schedule cron.Schedule, err error) {
+	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	return parser.Parse(strings.TrimSpace(expression))
+}
 
-	return
+func intervalSecondsToCron(seconds int64) string {
+	switch {
+	case seconds <= 0:
+		return ""
+	case seconds < 60:
+		return fmt.Sprintf("*/%d * * * * *", seconds)
+	case seconds%3600 == 0:
+		return fmt.Sprintf("0 0 */%d * * *", seconds/3600)
+	case seconds%60 == 0:
+		return fmt.Sprintf("0 */%d * * * *", seconds/60)
+	default:
+		return fmt.Sprintf("*/%d * * * * *", seconds)
+	}
 }

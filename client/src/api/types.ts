@@ -176,6 +176,7 @@ export interface ScheduledJob {
     max_runs: number;
     disable_after: string;
     enabled: boolean;
+    next_run_at: string;
 }
 
 export interface SchedulerSnapshot {

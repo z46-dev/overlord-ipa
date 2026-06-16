@@ -3,8 +3,6 @@ import type { Job, JobRun } from "../api/types";
 
 export function formatSchedule(job: Job): string {
     switch (job.schedule_type) {
-        case 1:
-            return job.interval_seconds > 0 ? `Every ${formatDuration(job.interval_seconds)}` : "Interval";
         case 2:
             return "Manual";
         case 3:
@@ -44,8 +42,6 @@ export function cronExpressionValid(expression: string): boolean {
 
 export function scheduleTypeLabel(job: Job): string {
     switch (job.schedule_type) {
-        case 1:
-            return "Interval";
         case 2:
             return "Manual";
         case 3:
@@ -57,8 +53,6 @@ export function scheduleTypeLabel(job: Job): string {
 
 export function scheduleTone(job: Job): "neutral" | "success" | "warning" | "danger" | "info" {
     switch (job.schedule_type) {
-        case 1:
-            return "info";
         case 2:
             return "neutral";
         case 3:
@@ -122,20 +116,4 @@ export function formatDateTime(value: string): string {
     }
 
     return date.toLocaleString();
-}
-
-function formatDuration(seconds: number): string {
-    if (seconds % 86400 === 0) {
-        return `${seconds / 86400}d`;
-    }
-
-    if (seconds % 3600 === 0) {
-        return `${seconds / 3600}h`;
-    }
-
-    if (seconds % 60 === 0) {
-        return `${seconds / 60}m`;
-    }
-
-    return `${seconds}s`;
 }

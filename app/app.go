@@ -56,7 +56,7 @@ func New(logger *golog.Logger) (application *Application, err error) {
 		return
 	}
 
-	scheduler = services.NewScheduler(repository, services.NewMockExecutor())
+	scheduler = services.NewScheduler(repository, jobService, logger)
 	dashboardService = services.NewDashboardService(repository)
 
 	fiberApp = fiber.New(fiber.Config{
@@ -102,6 +102,13 @@ func (a *Application) Run(ctx context.Context) (err error) {
 		var queueErr error
 		if queueErr = a.queue.Run(ctx); queueErr != nil && ctx.Err() == nil {
 			fmt.Printf("job queue stopped: %v\n", queueErr)
+		}
+	}()
+
+	go func() {
+		var schedulerErr error
+		if schedulerErr = a.scheduler.Run(ctx); schedulerErr != nil && ctx.Err() == nil {
+			fmt.Printf("scheduler stopped: %v\n", schedulerErr)
 		}
 	}()
 

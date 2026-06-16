@@ -29,6 +29,8 @@ func (s *Server) RegisterRoutes(dependencies ServerDependencies) {
 	api.Get("/auth/me", dependencies.Auth.Me)
 	api.Post("/auth/logout", dependencies.Auth.Logout)
 
+	s.app.Get("/login", dependencies.Auth.LoginPage)
+
 	var viewerAPI fiber.Router = api.Group("", dependencies.Auth.RequireViewer)
 	viewerAPI.Get("/dashboard/summary", dependencies.Dashboard.Summary)
 	viewerAPI.Get("/hosts", dependencies.Hosts.List)

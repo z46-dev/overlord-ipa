@@ -21,6 +21,7 @@ type JobService interface {
 }
 
 type SchedulerService interface {
+	Load(ctx context.Context) error
 	Snapshot() services.SchedulerSnapshot
 }
 
@@ -62,7 +63,7 @@ func (h *JobsHandler) List(c fiber.Ctx) (err error) {
 		}
 	}
 
-	if runs, err = h.jobs.ListRecentJobRuns(c.Context(), 20); err != nil {
+	if runs, err = h.jobs.ListRecentJobRuns(c.Context(), 100); err != nil {
 		err = writeError(c, err)
 		return
 	}
@@ -113,6 +114,11 @@ func (h *JobsHandler) Create(c fiber.Ctx) (err error) {
 		return
 	}
 
+	if err = h.scheduler.Load(c.Context()); err != nil {
+		err = writeError(c, err)
+		return
+	}
+
 	if err = c.Status(fiber.StatusCreated).JSON(job); err != nil {
 		return
 	}
@@ -139,6 +145,11 @@ func (h *JobsHandler) Update(c fiber.Ctx) (err error) {
 	}
 
 	if job, err = h.jobs.UpdateJob(c.Context(), jobID, input); err != nil {
+		err = writeError(c, err)
+		return
+	}
+
+	if err = h.scheduler.Load(c.Context()); err != nil {
 		err = writeError(c, err)
 		return
 	}

@@ -1,7 +1,20 @@
-import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { createJob, getDataFiles, getHostGroups, getJobs, runJob, updateJob } from "../api/client";
-import type { DataFileInfo, Job, JobAction, JobActionInput, JobActionType, JobInput, JobLongevityType, JobRun, SchedulerSnapshot, ScheduleType } from "../api/types";
+import type {
+    DataFileInfo,
+    Job,
+    JobAction,
+    JobActionInput,
+    JobActionRun,
+    JobActionType,
+    JobHostResult,
+    JobInput,
+    JobLongevityType,
+    JobRun,
+    SchedulerSnapshot,
+    ScheduleType
+} from "../api/types";
 import { DataTable, type DataTableColumn } from "../components/DataTable";
 import { StatusBadge } from "../components/StatusBadge";
 import { cronExpressionValid, formatCronDescription, formatDateTime, formatSchedule, jobEnabledTone, jobRunStatusLabel, jobRunStatusTone, scheduleTone, scheduleTypeLabel } from "./format";
@@ -9,6 +22,8 @@ import { cronExpressionValid, formatCronDescription, formatDateTime, formatSched
 interface JobsProps {
     canEdit: boolean;
     openJobID?: number | null;
+    onJobClosed?: () => void;
+    onJobSelected?: (jobID: number) => void;
     onOpenJobHandled?: () => void;
 }
 
@@ -18,7 +33,6 @@ const actionTypes: Array<{ value: JobActionType; label: string }> = [
 ];
 
 const scheduleOptions: Array<{ value: ScheduleType; label: string }> = [
-    { value: 1, label: "Interval" },
     { value: 3, label: "Cron" },
     { value: 2, label: "Manual" }
 ];
@@ -28,6 +42,9 @@ const longevityOptions: Array<{ value: JobLongevityType; label: string }> = [
     { value: 2, label: "Run count" },
     { value: 3, label: "Until date" }
 ];
+
+const jobsRefreshIntervalMS = 2000;
+const hiddenJobsRefreshIntervalMS = 10000;
 
 function newActionInput(): JobActionInput {
     return {
@@ -46,7 +63,7 @@ function newJobInput(): JobInput {
         name: "",
         description: "",
         enabled: false,
-        interval_seconds: 300,
+        interval_seconds: 0,
         schedule_type: 2,
         cron_expr: "",
         longevity_type: 1,
@@ -73,10 +90,12 @@ function actionToInput(action: JobAction | undefined): JobActionInput {
     };
 }
 
-export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
+export function Jobs({ canEdit, openJobID, onJobClosed, onJobSelected, onOpenJobHandled }: JobsProps) {
     const [jobs, setJobs] = useState<Job[]>([]);
     const [jobActions, setJobActions] = useState<Record<string, JobAction[]>>({});
     const [jobRuns, setJobRuns] = useState<JobRun[]>([]);
+    const [jobActionRuns, setJobActionRuns] = useState<JobActionRun[]>([]);
+    const [jobHostResults, setJobHostResults] = useState<JobHostResult[]>([]);
     const [scheduler, setScheduler] = useState<SchedulerSnapshot>({ loaded_jobs: [] });
     const [hostGroups, setHostGroups] = useState<string[]>([]);
     const [dataFiles, setDataFiles] = useState<DataFileInfo[]>([]);
@@ -88,21 +107,29 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
     const [editorOpen, setEditorOpen] = useState(false);
     const [saving, setSaving] = useState(false);
     const [runningJobID, setRunningJobID] = useState<number | null>(null);
+    const [expandedRunID, setExpandedRunID] = useState<number | null>(null);
     const [hostGroupQuery, setHostGroupQuery] = useState("");
     const [hostGroupOpen, setHostGroupOpen] = useState(false);
 
-    const loadJobs = () => {
-        getJobs()
+    const loadJobs = useCallback((options: { silent?: boolean } = {}) => {
+        return getJobs()
             .then((response) => {
                 setJobs(response.jobs);
                 setJobActions(response.actions ?? {});
                 setJobRuns(response.runs ?? []);
+                setJobActionRuns(response.action_runs ?? []);
+                setJobHostResults(response.host_results ?? []);
                 setScheduler(response.scheduler);
+                if (!options.silent) {
+                    setError("");
+                }
             })
             .catch((err: unknown) => {
-                setError(err instanceof Error ? err.message : "Unable to load jobs");
+                if (!options.silent) {
+                    setError(err instanceof Error ? err.message : "Unable to load jobs");
+                }
             });
-    };
+    }, []);
 
     const loadDataFiles = () => {
         getDataFiles()
@@ -123,7 +150,55 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
             .catch((err: unknown) => {
                 setFormError(err instanceof Error ? err.message : "Unable to load host groups");
             });
-    }, [canEdit]);
+    }, [canEdit, loadJobs]);
+
+    useEffect(() => {
+        let stopped = false;
+        let refreshing = false;
+        let timerID: number | undefined;
+
+        const schedule = () => {
+            const interval = document.visibilityState === "hidden" ? hiddenJobsRefreshIntervalMS : jobsRefreshIntervalMS;
+            timerID = window.setTimeout(refresh, interval);
+        };
+
+        const refresh = () => {
+            if (stopped || refreshing) {
+                return;
+            }
+
+            refreshing = true;
+            loadJobs({ silent: true }).finally(() => {
+                refreshing = false;
+                if (!stopped) {
+                    schedule();
+                }
+            });
+        };
+
+        const handleVisibilityChange = () => {
+            if (document.visibilityState !== "visible") {
+                return;
+            }
+
+            if (timerID !== undefined) {
+                window.clearTimeout(timerID);
+                timerID = undefined;
+            }
+            refresh();
+        };
+
+        schedule();
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+
+        return () => {
+            stopped = true;
+            if (timerID !== undefined) {
+                window.clearTimeout(timerID);
+            }
+            document.removeEventListener("visibilitychange", handleVisibilityChange);
+        };
+    }, [loadJobs]);
 
     useEffect(() => {
         if (!openJobID) {
@@ -163,6 +238,23 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
             latestRunByJobID.set(Number(run.job_id), run);
         }
     }
+    const jobsByID = new Map(jobs.map((job) => [job.id, job]));
+    const actionsByID = new Map<number, JobAction>();
+    for (const actions of Object.values(jobActions)) {
+        for (const action of actions) {
+            actionsByID.set(action.id, action);
+        }
+    }
+    const actionRunsByRunID = new Map<number, JobActionRun[]>();
+    for (const actionRun of jobActionRuns) {
+        const runID = Number(actionRun.job_run_id);
+        actionRunsByRunID.set(runID, [...(actionRunsByRunID.get(runID) ?? []), actionRun]);
+    }
+    const hostResultsByRunID = new Map<number, JobHostResult[]>();
+    for (const hostResult of jobHostResults) {
+        const runID = Number(hostResult.job_run_id);
+        hostResultsByRunID.set(runID, [...(hostResultsByRunID.get(runID) ?? []), hostResult]);
+    }
 
     const availableActionFiles = dataFiles.filter((file) => {
         if (selectedAction.type === 1) {
@@ -195,9 +287,9 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
             name: job.name,
             description: job.description,
             enabled: job.enabled,
-            interval_seconds: job.interval_seconds || 300,
-            schedule_type: job.schedule_type,
-            cron_expr: job.cron_expr,
+            interval_seconds: 0,
+            schedule_type: job.schedule_type === 1 ? 3 : job.schedule_type,
+            cron_expr: job.schedule_type === 1 ? intervalSecondsToCron(job.interval_seconds) : job.cron_expr,
             longevity_type: job.longevity_type || 1,
             max_runs: job.max_runs || 0,
             disable_after: job.disable_after || zeroTime(),
@@ -215,6 +307,12 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
         setHostGroupQuery("");
         setHostGroupOpen(false);
         setInput(newJobInput());
+        onJobClosed?.();
+    };
+
+    const openSelectedJob = (job: Job) => {
+        onJobSelected?.(job.id);
+        openEditJob(job);
     };
 
     const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -273,7 +371,7 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
         setInput({
             ...input,
             schedule_type: scheduleType,
-            interval_seconds: scheduleType === 1 ? input.interval_seconds || 300 : input.interval_seconds,
+            interval_seconds: 0,
             cron_expr: scheduleType === 3 ? input.cron_expr : ""
         });
     };
@@ -376,7 +474,49 @@ export function Jobs({ canEdit, openJobID, onOpenJobHandled }: JobsProps) {
 
             {error ? <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div> : null}
             {notice ? <div className="rounded border border-[#9dbfe0] bg-[#e8f1fa] px-3 py-2 text-sm text-[#155a96]">{notice}</div> : null}
-            <DataTable columns={columns} rows={jobs} getRowKey={(job) => job.id} emptyLabel="No jobs configured" onRowClick={canEdit ? openEditJob : undefined} />
+            <DataTable columns={columns} rows={jobs} getRowKey={(job) => job.id} emptyLabel="No jobs configured" onRowClick={canEdit ? openSelectedJob : undefined} />
+
+            <section className="space-y-2">
+                <div className="flex items-center justify-between">
+                    <h2 className="text-base font-semibold text-[#1f2933]">Recent Runs</h2>
+                    <button className="rounded-sm border border-[#d1d5db] px-3 py-1.5 text-sm" type="button" onClick={() => loadJobs()}>
+                        Refresh
+                    </button>
+                </div>
+                <div className="overflow-hidden rounded-sm border border-[#d1d5db] bg-white">
+                    {jobRuns.length === 0 ? (
+                        <div className="px-3 py-4 text-sm text-[#6b7280]">No job runs recorded</div>
+                    ) : (
+                        jobRuns.map((run) => {
+                            const expanded = expandedRunID === run.id;
+                            const actionRuns = actionRunsByRunID.get(run.id) ?? [];
+                            const hostResults = hostResultsByRunID.get(run.id) ?? [];
+                            const job = jobsByID.get(Number(run.job_id));
+
+                            return (
+                                <div className="border-b border-[#e5e7eb] last:border-b-0" key={run.id}>
+                                    <button
+                                        className="grid w-full gap-2 px-3 py-2 text-left text-sm hover:bg-[#f8fafc] md:grid-cols-[120px_minmax(180px,1fr)_180px_160px_100px]"
+                                        type="button"
+                                        onClick={() => setExpandedRunID(expanded ? null : run.id)}
+                                    >
+                                        <span className="flex items-center gap-2">
+                                            <StatusBadge label={jobRunStatusLabel(run)} tone={jobRunStatusTone(run)} />
+                                        </span>
+                                        <span className="font-medium text-[#1f2933]">{job?.name ?? `Job #${run.job_id}`}</span>
+                                        <span className="text-[#6b7280]">{formatDateTime(run.start_time)}</span>
+                                        <span className="text-[#6b7280]">
+                                            {run.success_hosts}/{run.total_hosts || run.target_hosts?.length || 0} hosts
+                                        </span>
+                                        <span className="text-right font-medium text-[#1f6fb2]">{expanded ? "Hide" : "Details"}</span>
+                                    </button>
+                                    {expanded ? <RunDetails run={run} actionRuns={actionRuns} actionsByID={actionsByID} hostResults={hostResults} /> : null}
+                                </div>
+                            );
+                        })
+                    )}
+                </div>
+            </section>
 
             {canEdit && editorOpen ? (
                 <div
@@ -523,6 +663,171 @@ function ScheduleCell({ job }: { job: Job }) {
     );
 }
 
+function RunDetails({
+    run,
+    actionRuns,
+    actionsByID,
+    hostResults
+}: {
+    run: JobRun;
+    actionRuns: JobActionRun[];
+    actionsByID: Map<number, JobAction>;
+    hostResults: JobHostResult[];
+}) {
+    return (
+        <div className="space-y-3 border-t border-[#e5e7eb] bg-[#f8fafc] px-3 py-3">
+            <div className="grid gap-2 text-sm md:grid-cols-4">
+                <DetailItem label="Run ID" value={`#${run.id}`} />
+                <DetailItem label="Triggered by" value={run.triggered_by || "Unknown"} />
+                <DetailItem label="Started" value={formatDateTime(run.start_time)} />
+                <DetailItem label="Ended" value={formatDateTime(run.end_time)} />
+            </div>
+            {run.summary || run.error ? (
+                <div className="rounded-sm border border-[#d1d5db] bg-white px-3 py-2 text-sm">
+                    {run.summary ? <div>{run.summary}</div> : null}
+                    {run.error ? <div className="mt-1 text-red-800">{run.error}</div> : null}
+                </div>
+            ) : null}
+            <div className="grid gap-3 lg:grid-cols-2">
+                <section className="min-w-0 space-y-2">
+                    <h3 className="text-sm font-semibold text-[#1f2933]">Action Output</h3>
+                    {actionRuns.length === 0 ? <div className="rounded-sm border border-[#d1d5db] bg-white px-3 py-2 text-sm text-[#6b7280]">No action output recorded</div> : null}
+                    {actionRuns.map((actionRun) => {
+                        const action = actionsByID.get(Number(actionRun.job_action_id));
+                        return (
+                            <div className="overflow-hidden rounded-sm border border-[#d1d5db] bg-white" key={actionRun.id}>
+                                <div className="flex items-center justify-between border-b border-[#e5e7eb] bg-[#eef0f2] px-3 py-2 text-sm">
+                                    <span className="font-semibold">{action?.name ?? `Action #${actionRun.job_action_id}`}</span>
+                                    <StatusBadge label={runStatusLabel(actionRun.status)} tone={runStatusTone(actionRun.status)} />
+                                </div>
+                                <div className="space-y-2 p-3">
+                                    {actionRun.error ? <div className="text-sm text-red-800">{actionRun.error}</div> : null}
+                                    <OutputBlock label="stdout" value={actionRun.stdout} />
+                                    <OutputBlock label="stderr" value={actionRun.stderr} />
+                                </div>
+                            </div>
+                        );
+                    })}
+                </section>
+                <section className="min-w-0 space-y-2">
+                    <h3 className="text-sm font-semibold text-[#1f2933]">Host Results</h3>
+                    {hostResults.length === 0 ? <div className="rounded-sm border border-[#d1d5db] bg-white px-3 py-2 text-sm text-[#6b7280]">No host results recorded</div> : null}
+                    {hostResults.map((result) => (
+                        <div className="rounded-sm border border-[#d1d5db] bg-white px-3 py-2 text-sm" key={result.id}>
+                            <div className="flex items-center justify-between gap-2">
+                                <span className="font-semibold">{result.hostname}</span>
+                                <StatusBadge label={hostResultStatusLabel(result)} tone={hostResultStatusTone(result)} />
+                            </div>
+                            {result.message ? <div className="mt-1 text-[#6b7280]">{result.message}</div> : null}
+                            {result.result_json ? (
+                                <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-sm bg-[#1f2933] p-2 font-mono text-xs text-white">{formatJSON(result.result_json)}</pre>
+                            ) : null}
+                        </div>
+                    ))}
+                </section>
+            </div>
+        </div>
+    );
+}
+
+function DetailItem({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="rounded-sm border border-[#d1d5db] bg-white px-3 py-2">
+            <div className="text-xs text-[#6b7280]">{label}</div>
+            <div className="font-medium text-[#1f2933]">{value}</div>
+        </div>
+    );
+}
+
+function OutputBlock({ label, value }: { label: string; value: string }) {
+    return (
+        <div>
+            <div className="mb-1 text-xs font-semibold uppercase text-[#6b7280]">{label}</div>
+            <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-sm bg-[#1f2933] p-2 font-mono text-xs text-white">{value || "No output"}</pre>
+        </div>
+    );
+}
+
+function hostResultStatusLabel(result: JobHostResult): string {
+    switch (result.status) {
+        case 1:
+            return result.changed ? "Changed" : "Success";
+        case 2:
+            return "Failed";
+        case 3:
+            return "Unreachable";
+        case 4:
+            return "Skipped";
+        case 5:
+            return "Changed";
+        default:
+            return "Unknown";
+    }
+}
+
+function hostResultStatusTone(result: JobHostResult): "neutral" | "success" | "warning" | "danger" | "info" {
+    switch (result.status) {
+        case 1:
+            return result.changed ? "info" : "success";
+        case 2:
+        case 3:
+            return "danger";
+        case 4:
+            return "warning";
+        case 5:
+            return "info";
+        default:
+            return "neutral";
+    }
+}
+
+function runStatusLabel(status: number): string {
+    switch (status) {
+        case 1:
+            return "Queued";
+        case 2:
+            return "Running";
+        case 3:
+            return "Success";
+        case 4:
+            return "Failed";
+        case 5:
+            return "Partial";
+        case 6:
+            return "Canceled";
+        case 7:
+            return "Timeout";
+        default:
+            return "Unknown";
+    }
+}
+
+function runStatusTone(status: number): "neutral" | "success" | "warning" | "danger" | "info" {
+    switch (status) {
+        case 1:
+        case 2:
+            return "info";
+        case 3:
+            return "success";
+        case 4:
+        case 7:
+            return "danger";
+        case 5:
+        case 6:
+            return "warning";
+        default:
+            return "neutral";
+    }
+}
+
+function formatJSON(value: string): string {
+    try {
+        return JSON.stringify(JSON.parse(value), null, 2);
+    } catch {
+        return value;
+    }
+}
+
 function LastRunCell({ run }: { run?: JobRun }) {
     if (!run) {
         return <span className="text-sm text-[#6b7280]">Never</span>;
@@ -544,7 +849,7 @@ function ScheduleEditor({ input, onChange, onTypeChange }: { input: JobInput; on
         <div className="md:col-span-6">
             <div className="mb-1 text-sm font-medium">Schedule</div>
             <div className="overflow-hidden rounded-sm border border-[#d1d5db] bg-white">
-                <div className="grid md:grid-cols-3">
+                <div className="grid md:grid-cols-2">
                     {scheduleOptions.map((option) => (
                         <button className={segmentButtonClass(input.schedule_type === option.value)} key={option.value} type="button" onClick={() => onTypeChange(option.value)}>
                             {option.label}
@@ -552,23 +857,11 @@ function ScheduleEditor({ input, onChange, onTypeChange }: { input: JobInput; on
                     ))}
                 </div>
                 <div className="border-t border-[#d1d5db] bg-[#f8fafc] px-3 py-2">
-                    {input.schedule_type === 1 ? (
-                        <label className="flex items-center gap-3 text-sm font-medium">
-                            Interval seconds
-                            <input
-                                className="w-32 rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 text-sm text-[#1f2933]"
-                                min={1}
-                                type="number"
-                                value={input.interval_seconds}
-                                onChange={(event) => onChange({ ...input, interval_seconds: Number(event.target.value) })}
-                            />
-                        </label>
-                    ) : null}
-
                     {input.schedule_type === 3 ? (
                         <div className="grid gap-2 md:grid-cols-[minmax(220px,340px)_1fr]">
                             <input
                                 className="rounded-sm border border-[#d1d5db] bg-white px-2 py-1.5 font-mono text-xs text-[#1f2933]"
+                                placeholder="*/30 * * * * *"
                                 value={input.cron_expr}
                                 onChange={(event) => onChange({ ...input, cron_expr: event.target.value })}
                             />
@@ -636,6 +929,26 @@ function segmentButtonClass(active: boolean): string {
     }
 
     return "h-10 border-r border-[#d1d5db] border-b-2 border-b-transparent bg-white px-3 text-left text-sm font-medium text-[#1f2933] hover:bg-[#eef0f2] last:border-r-0";
+}
+
+function intervalSecondsToCron(seconds: number): string {
+    if (seconds <= 0) {
+        return "";
+    }
+
+    if (seconds < 60) {
+        return `*/${seconds} * * * * *`;
+    }
+
+    if (seconds % 3600 === 0) {
+        return `0 0 */${seconds / 3600} * * *`;
+    }
+
+    if (seconds % 60 === 0) {
+        return `0 */${seconds / 60} * * * *`;
+    }
+
+    return `*/${seconds} * * * * *`;
 }
 
 function formatLongevity(job: Job): string {
